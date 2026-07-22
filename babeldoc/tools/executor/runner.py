@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 import multiprocessing
+import os
 import shutil
+import signal
 import threading
 import time
 from collections.abc import Callable
@@ -10,10 +12,13 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+import psutil
+from babeldoc.tools.executor.protocol import TERMINAL_EVENT_TYPES
 from babeldoc.tools.executor.protocol import WorkerEvent
 
 ProcessTarget = Callable[[dict[str, Any], Any, Any], None]
 logger = logging.getLogger(__name__)
+KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 
 def _configure_child_logging() -> None:
@@ -36,6 +41,7 @@ def _run_process_target(
     progress_send,
     cancel_recv,
 ) -> None:
+    _isolate_process_group()
     _configure_child_logging()
     task_id = _task_id(request)
     started_at = time.monotonic()
@@ -53,6 +59,15 @@ def _run_process_target(
 
 def _forkserver_warmup_target() -> None:
     return
+
+
+def _isolate_process_group() -> None:
+    if not hasattr(os, "setsid"):
+        return
+    try:
+        os.setsid()
+    except OSError:
+        logger.warning("executor subprocess could not create a private process group")
 
 
 class ExecutionRunner:
@@ -173,6 +188,10 @@ class FakeExecutionRunner(ExecutionRunner):
 
     @staticmethod
     def _resolve_io(request: dict[str, Any]) -> tuple[Path, Path]:
+        from babeldoc.tools.executor.workroot import get_workroot
+        from babeldoc.tools.executor.workroot import resolve_dir
+        from babeldoc.tools.executor.workroot import resolve_file
+
         paths = request.get("paths")
         if not isinstance(paths, dict):
             raise ValueError("paths must be an object")
@@ -184,14 +203,9 @@ class FakeExecutionRunner(ExecutionRunner):
         if not isinstance(output_value, str) or not output_value:
             raise ValueError("paths.output_dir is required")
 
-        input_path = Path(input_value)
-        output_dir = Path(output_value)
-        if not input_path.is_absolute():
-            input_path = Path.cwd() / input_path
-        if not output_dir.is_absolute():
-            output_dir = Path.cwd() / output_dir
-        if not input_path.is_file():
-            raise FileNotFoundError(str(input_path))
+        workroot = get_workroot(require_ready_file=True)
+        input_path = resolve_file(workroot, input_value)
+        output_dir = resolve_dir(workroot, output_value, create=True)
         return input_path, output_dir
 
 
@@ -247,7 +261,14 @@ class MultiprocessExecutionRunner(ExecutionRunner):
             args=(self._target, request, progress_send, cancel_recv),
         )
         started_at = time.monotonic()
-        process.start()
+        try:
+            process.start()
+        except BaseException:
+            progress_recv.close()
+            progress_send.close()
+            cancel_recv.close()
+            cancel_send.close()
+            raise
         logger.info(
             "executor subprocess started: task_id=%s pid=%s start_elapsed=%.3fs",
             task_id,
@@ -258,15 +279,25 @@ class MultiprocessExecutionRunner(ExecutionRunner):
         cancel_recv.close()
 
         terminal_seen = False
+        cancellation_requested = False
+        cancellation_cleanup_completed = False
         try:
             while True:
                 if abort_event.is_set():
+                    cancellation_requested = True
                     logger.warning(
                         "executor subprocess cancellation requested: task_id=%s pid=%s",
                         task_id,
                         process.pid,
                     )
-                    self._send_cancel(cancel_send)
+                    terminal_seen = self._cancel_process(
+                        process,
+                        progress_recv,
+                        cancel_send,
+                        emit,
+                        terminal_seen,
+                    )
+                    cancellation_cleanup_completed = True
                     return
 
                 if progress_recv.poll(self._poll_seconds):
@@ -282,6 +313,7 @@ class MultiprocessExecutionRunner(ExecutionRunner):
                                 process.exitcode,
                             )
                             self._emit_missing_terminal_error(process.exitcode, emit)
+                            terminal_seen = True
                         return
                     if item is None:
                         if not terminal_seen:
@@ -293,25 +325,36 @@ class MultiprocessExecutionRunner(ExecutionRunner):
                                 process.exitcode,
                             )
                             self._emit_missing_terminal_error(process.exitcode, emit)
+                            terminal_seen = True
                         return
 
                     event = self._coerce_event(item)
-                    emit(event)
-                    if event.type in {"result", "error"}:
-                        terminal_seen = True
+                    terminal_seen = self._emit_unless_terminal_seen(
+                        event,
+                        emit,
+                        terminal_seen,
+                    )
+                    if terminal_seen:
                         if event.type == "result":
                             logger.info(
                                 "executor subprocess emitted terminal result: task_id=%s pid=%s",
                                 task_id,
                                 process.pid,
                             )
-                        else:
+                        elif event.type == "error":
                             logger.warning(
                                 "executor subprocess emitted terminal error: task_id=%s pid=%s code=%s message=%s",
                                 task_id,
                                 process.pid,
                                 event.payload.get("code"),
                                 event.payload.get("message"),
+                            )
+                        else:
+                            logger.info(
+                                "executor subprocess emitted terminal cancelled: task_id=%s pid=%s reason=%s",
+                                task_id,
+                                process.pid,
+                                event.payload.get("reason"),
                             )
                         return
                     continue
@@ -329,12 +372,19 @@ class MultiprocessExecutionRunner(ExecutionRunner):
                             process.exitcode,
                         )
                         self._emit_missing_terminal_error(process.exitcode, emit)
+                        terminal_seen = True
                     return
         finally:
-            self._send_cancel(cancel_send)
-            cancel_send.close()
-            progress_recv.close()
-            self._stop_process(process)
+            try:
+                if cancellation_requested and not cancellation_cleanup_completed:
+                    self._stop_process(process)
+                elif not cancellation_requested and terminal_seen:
+                    self._wait_for_terminal_exit(process)
+                elif not cancellation_requested:
+                    self._stop_process(process)
+            finally:
+                cancel_send.close()
+                progress_recv.close()
 
     @staticmethod
     def _coerce_event(item: Any) -> WorkerEvent:
@@ -361,9 +411,90 @@ class MultiprocessExecutionRunner(ExecutionRunner):
             if item is None:
                 return terminal_seen
             event = self._coerce_event(item)
-            emit(event)
-            terminal_seen = event.type in {"result", "error"}
+            terminal_seen = self._emit_unless_terminal_seen(
+                event,
+                emit,
+                terminal_seen,
+            )
         return terminal_seen
+
+    def _cancel_process(
+        self,
+        process: multiprocessing.Process,
+        progress_recv: Any,
+        cancel_send: Any,
+        emit: Callable[[WorkerEvent], None],
+        terminal_seen: bool,
+    ) -> bool:
+        process_group_id = process.pid
+        self._send_cancel(cancel_send)
+        deadline = time.monotonic() + self._join_timeout_seconds
+        while process.is_alive() and time.monotonic() < deadline:
+            remaining = max(0.0, deadline - time.monotonic())
+            if progress_recv.poll(min(self._poll_seconds, remaining)):
+                try:
+                    item = progress_recv.recv()
+                except EOFError:
+                    break
+                if item is None:
+                    break
+                event = self._coerce_event(item)
+                if event.type == "cancelled":
+                    terminal_seen = self._emit_unless_terminal_seen(
+                        event,
+                        emit,
+                        terminal_seen,
+                    )
+                elif event.type not in TERMINAL_EVENT_TYPES and not terminal_seen:
+                    emit(event)
+            process.join(timeout=0)
+
+        if not process.is_alive():
+            terminal_seen = self._drain_cancelled_event(
+                progress_recv,
+                emit,
+                terminal_seen,
+            )
+        self._stop_process(process, process_group_id=process_group_id)
+        if not terminal_seen:
+            emit(WorkerEvent("cancelled", {"reason": "client_request"}))
+            terminal_seen = True
+        return terminal_seen
+
+    def _drain_cancelled_event(
+        self,
+        progress_recv: Any,
+        emit: Callable[[WorkerEvent], None],
+        terminal_seen: bool,
+    ) -> bool:
+        while progress_recv.poll():
+            try:
+                item = progress_recv.recv()
+            except EOFError:
+                return terminal_seen
+            if item is None:
+                return terminal_seen
+            event = self._coerce_event(item)
+            if event.type == "cancelled":
+                return self._emit_unless_terminal_seen(event, emit, terminal_seen)
+            if event.type not in TERMINAL_EVENT_TYPES and not terminal_seen:
+                emit(event)
+        return terminal_seen
+
+    @staticmethod
+    def _emit_unless_terminal_seen(
+        event: WorkerEvent,
+        emit: Callable[[WorkerEvent], None],
+        terminal_seen: bool,
+    ) -> bool:
+        if terminal_seen:
+            logger.warning(
+                "executor ignored event after terminal event: type=%s",
+                event.type,
+            )
+            return True
+        emit(event)
+        return event.type in TERMINAL_EVENT_TYPES
 
     @staticmethod
     def _send_cancel(cancel_send: Any) -> None:
@@ -392,24 +523,112 @@ class MultiprocessExecutionRunner(ExecutionRunner):
             )
         )
 
-    def _stop_process(self, process: multiprocessing.Process) -> None:
-        if not process.is_alive():
-            process.join(timeout=0)
-            return
-
-        logger.warning(
-            "executor subprocess still alive during cleanup; terminating pid=%s",
-            process.pid,
-        )
-        process.terminate()
+    def _wait_for_terminal_exit(self, process: multiprocessing.Process) -> None:
+        process_group_id = process.pid
         process.join(timeout=self._join_timeout_seconds)
-        if process.is_alive():
-            logger.error(
-                "executor subprocess did not terminate; killing pid=%s",
+        if process.is_alive() or self._process_group_exists(process_group_id):
+            logger.warning(
+                "executor subprocess group did not exit after terminal event: pid=%s",
                 process.pid,
             )
-            process.kill()
-            process.join()
+            self._stop_process(process, process_group_id=process_group_id)
+
+    def _stop_process(
+        self,
+        process: multiprocessing.Process,
+        *,
+        process_group_id: int | None = None,
+    ) -> None:
+        process_group_id = process_group_id or process.pid
+        group_exists = self._process_group_exists(process_group_id)
+        if not process.is_alive() and not group_exists:
+            process.join(timeout=0)
+            return
+        logger.warning(
+            "executor subprocess group still alive during cleanup; terminating pid=%s",
+            process.pid,
+        )
+        self._signal_process(
+            process,
+            signal.SIGTERM,
+            process_group_id=process_group_id,
+        )
+        deadline = time.monotonic() + self._join_timeout_seconds
+        while time.monotonic() < deadline:
+            process.join(timeout=0)
+            if not process.is_alive() and not self._process_group_exists(
+                process_group_id
+            ):
+                return
+            time.sleep(min(self._poll_seconds, max(0.0, deadline - time.monotonic())))
+        if process.is_alive() or self._process_group_exists(process_group_id):
+            logger.error(
+                "executor subprocess group did not terminate; killing pid=%s",
+                process.pid,
+            )
+            self._signal_process(
+                process,
+                KILL_SIGNAL,
+                process_group_id=process_group_id,
+                force=True,
+            )
+            process.join(timeout=self._join_timeout_seconds)
+            if process.is_alive() or self._process_group_exists(process_group_id):
+                logger.critical(
+                    "executor subprocess group survived SIGKILL deadline: pid=%s",
+                    process.pid,
+                )
+
+    @staticmethod
+    def _signal_process(
+        process: multiprocessing.Process,
+        signal_number: int,
+        *,
+        process_group_id: int | None = None,
+        force: bool = False,
+    ) -> None:
+        process_group_id = process_group_id or process.pid
+        if process_group_id is None:
+            return
+        if hasattr(os, "killpg"):
+            try:
+                os.killpg(process_group_id, signal_number)
+                return
+            except ProcessLookupError:
+                if not process.is_alive():
+                    return
+            except OSError:
+                pass
+        try:
+            if force:
+                process.kill()
+            else:
+                process.terminate()
+        except ProcessLookupError:
+            return
+
+    @staticmethod
+    def _process_group_exists(process_group_id: int | None) -> bool:
+        if process_group_id is None or not hasattr(os, "killpg"):
+            return False
+        try:
+            os.killpg(process_group_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        for member in psutil.process_iter(["pid", "status"]):
+            try:
+                if (
+                    os.getpgid(member.pid) == process_group_id
+                    and member.info["status"] != psutil.STATUS_ZOMBIE
+                ):
+                    return True
+            except (OSError, psutil.Error):
+                continue
+        return False
 
 
 def _task_id(request: dict[str, Any]) -> str:
