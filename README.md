@@ -1,3 +1,10 @@
+> [!IMPORTANT]
+> This is the **Gloss-maintained downstream** of
+> [funstory-ai/BabelDOC](https://github.com/funstory-ai/BabelDOC). It is not an
+> upstream release and is not endorsed by the upstream maintainers. See
+> [DOWNSTREAM.md](./DOWNSTREAM.md) for support scope, versioning, and the exact
+> upstream base.
+
 <div align="center">
 
 <br/>
