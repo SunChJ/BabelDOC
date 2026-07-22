@@ -37,7 +37,11 @@ def test_build_runtime_info_contract() -> None:
         "version": "0.6.4",
         "commit": "17480db9df92ddcb37349ce34b312335226e8ec9",
     }
-    assert payload["capabilities"] == ["runtime-info.v1"]
+    assert payload["capabilities"] == [
+        "executor.events.ndjson.v1",
+        "executor.http.v1",
+        "runtime-info.v1",
+    ]
 
 
 def test_runtime_info_json_output(capsys: pytest.CaptureFixture[str]) -> None:
@@ -101,3 +105,66 @@ def test_unknown_command_exits_with_argparse_error() -> None:
         cli(["unknown"])
 
     assert error.value.code == 2
+
+
+def test_serve_forwards_service_options(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    received: dict[str, object] = {}
+    token_file = tmp_path / "token"
+
+    def fake_serve(host: str, port: int, **kwargs: object) -> None:
+        received.update({"host": host, "port": port, **kwargs})
+
+    monkeypatch.setattr("babeldoc.tools.executor.server.serve", fake_serve)
+
+    assert (
+        cli(
+            [
+                "serve",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "49152",
+                "--runner",
+                "fake",
+                "--token-file",
+                str(token_file),
+                "--work-dir",
+                str(tmp_path),
+                "--instance-id",
+                "instance-1",
+                "--parent-pid",
+                "42",
+                "--parent-start-time",
+                "123.5",
+            ]
+        )
+        == 0
+    )
+    assert received == {
+        "host": "127.0.0.1",
+        "port": 49152,
+        "runner_name": "fake",
+        "token_file": str(token_file),
+        "work_dir": str(tmp_path),
+        "instance_id": "instance-1",
+        "parent_pid": 42,
+        "parent_start_time": 123.5,
+    }
+
+
+def test_serve_defaults_to_ephemeral_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received: dict[str, object] = {}
+
+    def fake_serve(host: str, port: int, **kwargs: object) -> None:
+        received.update({"host": host, "port": port, **kwargs})
+
+    monkeypatch.setattr("babeldoc.tools.executor.server.serve", fake_serve)
+
+    assert cli(["serve", "--runner", "fake"]) == 0
+    assert received["host"] == "127.0.0.1"
+    assert received["port"] == 0

@@ -138,6 +138,7 @@ nav:
   - Supported Languages: supported_languages.md
   - API:
     - Async Translation API: ImplementationDetails/AsyncTranslate/AsyncTranslate.md
+    - Gloss Service Boundary: gloss-service.md
   - Implementation Details:
     - ImplementationDetails/README.md
     - PDF Parsing: ImplementationDetails/PDFParsing/PDFParsing.md
