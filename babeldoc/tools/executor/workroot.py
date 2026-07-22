@@ -11,7 +11,9 @@ def get_workroot(*, require_ready_file: bool = False) -> Path:
     raw = os.environ.get(WORKROOT_ENV)
     if not raw:
         raise ValueError(f"{WORKROOT_ENV} is required")
-    workroot = Path(raw).resolve()
+    if "\x00" in raw:
+        raise ValueError(f"{WORKROOT_ENV} contains a NUL byte")
+    workroot = Path(os.path.normpath(os.path.realpath(raw)))
     if not workroot.is_dir():
         raise ValueError("executor workroot must be an existing directory")
     if not os.access(workroot, os.R_OK | os.W_OK):
@@ -22,17 +24,35 @@ def get_workroot(*, require_ready_file: bool = False) -> Path:
 
 
 def resolve_inside_workroot(workroot: Path, value: str) -> Path:
-    if not value:
+    if not isinstance(value, str) or not value:
         raise ValueError("path must be a non-empty string")
-    candidate = Path(value)
-    if not candidate.is_absolute():
-        candidate = workroot / candidate
-    resolved = candidate.resolve(strict=False)
-    try:
-        resolved.relative_to(workroot)
-    except ValueError as exc:
-        raise ValueError("path escapes executor workroot") from exc
-    return resolved
+    if "\x00" in value:
+        raise ValueError("path contains a NUL byte")
+
+    safe_root = os.path.normcase(
+        os.path.normpath(os.path.realpath(os.fspath(workroot))),
+    )
+    candidate = value
+    if not os.path.isabs(candidate):  # noqa: PTH117 - CodeQL path sanitizer
+        candidate = os.path.join(  # noqa: PTH118 - CodeQL path sanitizer
+            safe_root,
+            candidate,
+        )
+    resolved = os.path.normcase(os.path.normpath(os.path.realpath(candidate)))
+
+    # Keep the normalized value that reaches filesystem APIs behind a direct
+    # prefix guard. CodeQL recognizes this shape as a safe path access check.
+    if not resolved.startswith(safe_root):
+        raise ValueError("path escapes executor workroot")
+
+    # The separator-bounded check prevents prefix confusion such as allowing
+    # /work/jobs-attacker when the trusted root is /work/jobs.
+    root_prefix = safe_root
+    if not root_prefix.endswith(os.sep):
+        root_prefix += os.sep
+    if resolved != safe_root and not resolved.startswith(root_prefix):
+        raise ValueError("path escapes executor workroot")
+    return Path(resolved)
 
 
 def resolve_file(workroot: Path, value: str) -> Path:
@@ -54,8 +74,12 @@ def resolve_dir(workroot: Path, value: str, *, create: bool = False) -> Path:
 def relative_to_workroot(workroot: Path, value: Path | str | None) -> str | None:
     if value is None:
         return None
-    resolved = Path(value).resolve(strict=False)
-    try:
-        return str(resolved.relative_to(workroot))
-    except ValueError as exc:
-        raise ValueError("path escapes executor workroot") from exc
+    raw = os.fspath(value)
+    if not raw:
+        raise ValueError("path must be a non-empty string")
+    if "\x00" in raw:
+        raise ValueError("path contains a NUL byte")
+    raw = os.path.realpath(raw)
+    resolved = resolve_inside_workroot(workroot, raw)
+    safe_root = os.path.normpath(os.path.realpath(os.fspath(workroot)))
+    return os.path.relpath(resolved, safe_root)

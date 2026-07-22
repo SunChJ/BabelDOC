@@ -4,13 +4,12 @@ import argparse
 import hmac
 import json
 import logging
+import multiprocessing
 import os
 import secrets
 import signal
 import stat
 import string
-import subprocess
-import sys
 import threading
 import time
 import uuid
@@ -40,6 +39,9 @@ from babeldoc.tools.executor.workroot import resolve_inside_workroot
 
 logger = logging.getLogger(__name__)
 WATERMARK_TIMEOUT_SECONDS = 600
+WATERMARK_POLL_SECONDS = 0.05
+WATERMARK_TERMINATE_TIMEOUT_SECONDS = 1.0
+WATERMARK_KILL_TIMEOUT_SECONDS = 5.0
 MAX_JSON_BODY_BYTES = 1024 * 1024
 READY_PREFIX = "__GLOSS_BABELDOC_SERVICE_READY__"
 SERVICE_ID = "gloss-babeldoc"
@@ -50,6 +52,148 @@ SHUTDOWN_DRAIN_POLL_SECONDS = 0.25
 PARENT_WATCHDOG_INTERVAL_SECONDS = 1.0
 _TOKEN_CHARACTERS = frozenset(string.ascii_letters + string.digits + "-_")
 ALLOW_FAKE_RUNNER_ENV = "BABELDOC_EXECUTOR_ALLOW_FAKE"
+
+
+def _dispatch_watermark_operation(
+    operation: str,
+    input_file: Path,
+    output_file: Path,
+    asset_files: tuple[Path, ...],
+) -> None:
+    from babeldoc.tools.executor.watermark_transform import add_corner_watermark
+    from babeldoc.tools.executor.watermark_transform import add_tiled_watermark
+
+    if operation == "watermark1":
+        if len(asset_files) != 1:
+            raise ValueError("watermark1 requires exactly one asset")
+        add_tiled_watermark(input_file, output_file, asset_files[0])
+        return
+    if operation == "watermark2":
+        if len(asset_files) != 2:
+            raise ValueError("watermark2 requires exactly two assets")
+        add_corner_watermark(
+            input_file,
+            output_file,
+            asset_files[0],
+            asset_files[1],
+        )
+        return
+    raise ValueError("unsupported watermark operation")
+
+
+def _run_watermark_process_target(
+    operation: str,
+    input_file: Path,
+    output_file: Path,
+    asset_files: tuple[Path, ...],
+) -> None:
+    if hasattr(os, "setsid"):
+        try:
+            os.setsid()
+        except OSError:
+            pass
+    try:
+        _dispatch_watermark_operation(
+            operation,
+            input_file,
+            output_file,
+            asset_files,
+        )
+    except BaseException:
+        # Keep request-derived paths out of child tracebacks while preserving a
+        # non-zero exit status for the supervising service.
+        raise SystemExit(1) from None
+
+
+def _watermark_process_group_exists(process_group_id: int | None) -> bool:
+    if process_group_id is None or not hasattr(os, "killpg"):
+        return False
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    for member in psutil.process_iter(["pid", "status"]):
+        try:
+            if (
+                os.getpgid(member.pid) == process_group_id
+                and member.info["status"] != psutil.STATUS_ZOMBIE
+            ):
+                return True
+        except (OSError, psutil.Error):
+            continue
+    return False
+
+
+def _signal_watermark_process(
+    process: multiprocessing.Process,
+    signal_number: int,
+    *,
+    force: bool = False,
+) -> None:
+    process_group_id = process.pid
+    if process_group_id is None:
+        return
+    if hasattr(os, "killpg"):
+        try:
+            os.killpg(process_group_id, signal_number)
+            return
+        except ProcessLookupError:
+            if not process.is_alive():
+                return
+        except OSError:
+            pass
+    try:
+        if force:
+            process.kill()
+        else:
+            process.terminate()
+    except ProcessLookupError:
+        return
+
+
+def _stop_watermark_process(process: multiprocessing.Process) -> None:
+    process_group_id = process.pid
+    try:
+        if not process.is_alive() and not _watermark_process_group_exists(
+            process_group_id
+        ):
+            process.join(timeout=0)
+            return
+
+        _signal_watermark_process(process, signal.SIGTERM)
+        deadline = time.monotonic() + WATERMARK_TERMINATE_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            process.join(timeout=0)
+            if not process.is_alive() and not _watermark_process_group_exists(
+                process_group_id
+            ):
+                return
+            time.sleep(
+                min(
+                    WATERMARK_POLL_SECONDS,
+                    max(0.0, deadline - time.monotonic()),
+                )
+            )
+
+        if process.is_alive() or _watermark_process_group_exists(process_group_id):
+            _signal_watermark_process(
+                process,
+                getattr(signal, "SIGKILL", signal.SIGTERM),
+                force=True,
+            )
+            process.join(timeout=WATERMARK_KILL_TIMEOUT_SECONDS)
+            if process.is_alive() or _watermark_process_group_exists(process_group_id):
+                logger.critical(
+                    "watermark subprocess group survived cleanup: pid=%s",
+                    process.pid,
+                )
+    finally:
+        if not process.is_alive():
+            process.close()
 
 
 class RequestBodyError(ValueError):
@@ -535,7 +679,7 @@ class ExecutorHandler(BaseHTTPRequestHandler):
                 output_relative,
                 len(asset_files),
             )
-            self._run_watermark_subprocess(
+            self._run_watermark_process(
                 operation,
                 input_file,
                 output_file,
@@ -623,9 +767,11 @@ class ExecutorHandler(BaseHTTPRequestHandler):
             request,
         )
         output_file = resolve_inside_workroot(workroot, output_value)
-        output_file.parent.mkdir(parents=True, exist_ok=True)
         if input_file == output_file:
             raise ValueError("output_file must not overwrite input_file")
+        if output_file in asset_files:
+            raise ValueError("output_file must not overwrite an asset file")
+        output_file.parent.mkdir(parents=True, exist_ok=True)
         return operation_id, input_file, output_file, asset_files
 
     @staticmethod
@@ -657,36 +803,34 @@ class ExecutorHandler(BaseHTTPRequestHandler):
         return [asset_file_1, asset_file_2]
 
     @staticmethod
-    def _run_watermark_subprocess(
+    def _run_watermark_process(
         operation: str,
         input_file: Path,
         output_file: Path,
         asset_files: list[Path],
         abort_event,
     ) -> None:
-        command = [
-            sys.executable,
-            "-m",
-            "babeldoc.tools.executor.watermark_transform",
-            operation,
-            "--input",
-            str(input_file),
-            "--output",
-            str(output_file),
-        ]
-        for asset_file in asset_files:
-            command.extend(["--asset", str(asset_file)])
-        process = subprocess.Popen(  # noqa: S603
-            command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        context = multiprocessing.get_context("spawn")
+        process = context.Process(
+            target=_run_watermark_process_target,
+            args=(
+                operation,
+                input_file,
+                output_file,
+                tuple(asset_files),
+            ),
         )
+        try:
+            process.start()
+        except BaseException:
+            process.close()
+            raise
         deadline = time.monotonic() + WATERMARK_TIMEOUT_SECONDS
         try:
             while True:
-                return_code = process.poll()
-                if return_code is not None:
-                    if return_code != 0:
+                if not process.is_alive():
+                    process.join(timeout=0)
+                    if process.exitcode != 0:
                         raise RuntimeError("watermark transform failed")
                     if not output_file.is_file():
                         raise RuntimeError("watermark transform did not create output")
@@ -695,15 +839,9 @@ class ExecutorHandler(BaseHTTPRequestHandler):
                     raise TimeoutError("watermark transform aborted")
                 if time.monotonic() >= deadline:
                     raise TimeoutError("watermark transform timed out")
-                time.sleep(0.05)
+                time.sleep(WATERMARK_POLL_SECONDS)
         finally:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5)
+            _stop_watermark_process(process)
 
     def _stream_events(self, execution_id: str, after_seq: int):
         try:

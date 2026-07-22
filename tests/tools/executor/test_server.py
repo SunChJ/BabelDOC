@@ -14,6 +14,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
+import pymupdf
+import pytest
+from babeldoc.tools.executor import server as executor_server
 from babeldoc.tools.executor.protocol import EventEnvelope
 from babeldoc.tools.executor.runner import FakeExecutionRunner
 from babeldoc.tools.executor.server import ALLOW_FAKE_RUNNER_ENV
@@ -40,6 +43,55 @@ def prepare_private_workroot(path: Path) -> None:
     marker = path / WORKROOT_READY_FILE
     marker.write_text("ready\n", encoding="utf-8")
     marker.chmod(0o600)
+
+
+def write_blank_pdf(path: Path, *, width: float = 200, height: float = 200) -> None:
+    document = pymupdf.open()
+    document.new_page(width=width, height=height)
+    document.save(path)
+    document.close()
+
+
+class StubbornWatermarkProcess:
+    pid = 987_654_321
+
+    def __init__(self) -> None:
+        self.exitcode: int | None = None
+        self.started = False
+        self.terminated = False
+        self.killed = False
+        self.closed = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def is_alive(self) -> bool:
+        return self.exitcode is None
+
+    def join(self, timeout: float | None = None) -> None:
+        _ = timeout
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.killed = True
+        self.exitcode = -9
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class WatermarkProcessContext:
+    def __init__(self, process: StubbornWatermarkProcess) -> None:
+        self.process = process
+        self.target = None
+        self.args = None
+
+    def Process(self, *, target, args):  # noqa: N802
+        self.target = target
+        self.args = args
+        return self.process
 
 
 class GapDuringStreamStore:
@@ -730,6 +782,223 @@ def test_health_degrades_when_workroot_disappears(tmp_path: Path) -> None:
     assert payload["code"] == "workroot_unavailable"
 
 
+def test_watermark_dispatch_calls_only_the_fixed_transform_operations(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple] = []
+
+    def record_tiled(input_file: Path, output_file: Path, asset_file: Path) -> None:
+        calls.append(("watermark1", input_file, output_file, asset_file))
+
+    def record_corner(
+        input_file: Path,
+        output_file: Path,
+        black_asset_file: Path,
+        white_asset_file: Path,
+    ) -> None:
+        calls.append(
+            (
+                "watermark2",
+                input_file,
+                output_file,
+                black_asset_file,
+                white_asset_file,
+            )
+        )
+
+    monkeypatch.setattr(
+        "babeldoc.tools.executor.watermark_transform.add_tiled_watermark",
+        record_tiled,
+    )
+    monkeypatch.setattr(
+        "babeldoc.tools.executor.watermark_transform.add_corner_watermark",
+        record_corner,
+    )
+    input_file = tmp_path / "input.pdf"
+    output_file = tmp_path / "output.pdf"
+    black_asset = tmp_path / "black.pdf"
+    white_asset = tmp_path / "white.pdf"
+
+    executor_server._dispatch_watermark_operation(
+        "watermark1",
+        input_file,
+        output_file,
+        (black_asset,),
+    )
+    executor_server._dispatch_watermark_operation(
+        "watermark2",
+        input_file,
+        output_file,
+        (black_asset, white_asset),
+    )
+
+    assert calls == [
+        ("watermark1", input_file, output_file, black_asset),
+        ("watermark2", input_file, output_file, black_asset, white_asset),
+    ]
+
+
+def test_watermark_dispatch_rejects_unknown_operation(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="unsupported watermark operation"):
+        executor_server._dispatch_watermark_operation(
+            "user-provided-command",
+            tmp_path / "input.pdf",
+            tmp_path / "output.pdf",
+            (),
+        )
+
+
+def test_watermark_rejects_output_that_overwrites_an_asset(tmp_path: Path) -> None:
+    input_file = tmp_path / "input.pdf"
+    asset_file = tmp_path / "asset.pdf"
+    input_file.touch()
+    asset_file.touch()
+
+    with pytest.raises(ValueError, match="must not overwrite an asset file"):
+        ExecutorHandler._validate_watermark_request(
+            tmp_path,
+            "watermark1",
+            {
+                "operation_id": "asset-overwrite",
+                "input_file": input_file.name,
+                "output_file": asset_file.name,
+                "asset_file": asset_file.name,
+            },
+        )
+
+
+def test_watermark_process_closes_when_start_fails(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    process = StubbornWatermarkProcess()
+    context = WatermarkProcessContext(process)
+
+    def fail_start() -> None:
+        raise RuntimeError("spawn failed")
+
+    monkeypatch.setattr(process, "start", fail_start)
+    monkeypatch.setattr(
+        executor_server.multiprocessing,
+        "get_context",
+        lambda _start_method: context,
+    )
+
+    with pytest.raises(RuntimeError, match="spawn failed"):
+        ExecutorHandler._run_watermark_process(
+            "watermark1",
+            tmp_path / "input.pdf",
+            tmp_path / "output.pdf",
+            [tmp_path / "asset.pdf"],
+            threading.Event(),
+        )
+
+    assert process.closed is True
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "expected_message"),
+    [(1, "transform failed"), (0, "did not create output")],
+)
+def test_watermark_process_validates_natural_exit_and_closes(
+    monkeypatch,
+    tmp_path: Path,
+    exit_code: int,
+    expected_message: str,
+) -> None:
+    process = StubbornWatermarkProcess()
+    process.exitcode = exit_code
+    context = WatermarkProcessContext(process)
+    monkeypatch.setattr(
+        executor_server.multiprocessing,
+        "get_context",
+        lambda _start_method: context,
+    )
+
+    with pytest.raises(RuntimeError, match=expected_message):
+        ExecutorHandler._run_watermark_process(
+            "watermark1",
+            tmp_path / "input.pdf",
+            tmp_path / "missing-output.pdf",
+            [tmp_path / "asset.pdf"],
+            threading.Event(),
+        )
+
+    assert process.closed is True
+
+
+@pytest.mark.parametrize(
+    ("abort_requested", "expected_message"),
+    [(True, "aborted"), (False, "timed out")],
+)
+def test_watermark_cancel_and_timeout_escalate_and_close_process(
+    monkeypatch,
+    tmp_path: Path,
+    abort_requested: bool,
+    expected_message: str,
+) -> None:
+    process = StubbornWatermarkProcess()
+    context = WatermarkProcessContext(process)
+    requested_start_methods: list[str] = []
+
+    def get_context(start_method: str):
+        requested_start_methods.append(start_method)
+        return context
+
+    monkeypatch.setattr(executor_server.multiprocessing, "get_context", get_context)
+    monkeypatch.setattr(executor_server, "WATERMARK_POLL_SECONDS", 0)
+    monkeypatch.setattr(executor_server, "WATERMARK_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(
+        executor_server,
+        "WATERMARK_TERMINATE_TIMEOUT_SECONDS",
+        0,
+    )
+    abort_event = threading.Event()
+    if abort_requested:
+        abort_event.set()
+
+    with pytest.raises(TimeoutError, match=expected_message):
+        ExecutorHandler._run_watermark_process(
+            "watermark1",
+            tmp_path / "input.pdf",
+            tmp_path / "output.pdf",
+            [tmp_path / "asset.pdf"],
+            abort_event,
+        )
+
+    assert requested_start_methods == ["spawn"]
+    assert context.target is executor_server._run_watermark_process_target
+    assert process.started is True
+    assert process.terminated is True
+    assert process.killed is True
+    assert process.closed is True
+
+
+def test_watermark_transform_runs_in_a_spawned_process(tmp_path: Path) -> None:
+    input_file = tmp_path / "input.pdf"
+    black_asset = tmp_path / "black.pdf"
+    white_asset = tmp_path / "white.pdf"
+    output_file = tmp_path / "output.pdf"
+    write_blank_pdf(input_file)
+    write_blank_pdf(black_asset, width=20, height=10)
+    write_blank_pdf(white_asset, width=20, height=10)
+
+    ExecutorHandler._run_watermark_process(
+        "watermark2",
+        input_file,
+        output_file,
+        [black_asset, white_asset],
+        threading.Event(),
+    )
+
+    output_document = pymupdf.open(output_file)
+    try:
+        assert len(output_document) == 1
+    finally:
+        output_document.close()
+
+
 def test_watermark_uses_server_workroot_and_finishes_after_begin(
     monkeypatch,
     tmp_path: Path,
@@ -751,7 +1020,7 @@ def test_watermark_uses_server_workroot_and_finishes_after_begin(
 
     monkeypatch.setattr(
         ExecutorHandler,
-        "_run_watermark_subprocess",
+        "_run_watermark_process",
         staticmethod(write_output),
     )
     with running_server(
