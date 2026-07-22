@@ -36,7 +36,7 @@
 
 ### Contributor Checklist
 
-- [ ] I have fully read and understood the **[CONTRIBUTING.md](https://funstory-ai.github.io/BabelDOC/CONTRIBUTING/)** guide.
+- [ ] I have fully read and understood the **[downstream maintenance guide](https://github.com/SunChJ/BabelDOC/blob/main/DOWNSTREAM.md)**.
 - [ ] I have performed a self-review of my own code.
 - [ ] My changes follow the project's code style and guidelines
 - [ ] I have linked the related issue(s) in the description above (if applicable)
@@ -62,4 +62,4 @@
 
 ### Additional Notes
 
-<!-- Is there anything else the reviewer should know? For example, any dependencies, or potential impacts. --> 
+<!-- Is there anything else the reviewer should know? For example, any dependencies, or potential impacts. -->

@@ -1,0 +1,18 @@
+BabelDOC — Gloss downstream
+
+Original work:
+  BabelDOC
+  Copyright (C) 2024 funstory.ai limited
+  https://github.com/funstory-ai/BabelDOC
+
+Downstream modifications:
+  Copyright (C) 2026 SamsonCJ and contributors
+  https://github.com/SunChJ/BabelDOC
+
+This downstream was first modified for Gloss on 2026-07-21. The exact upstream
+base and downstream patch list are recorded in UPSTREAM_BASE.toml and
+DOWNSTREAM_PATCHES.md.
+
+The original work and downstream modifications are distributed under the GNU
+Affero General Public License, version 3 or (at your option) any later version.
+See LICENSE for the complete license and warranty disclaimer.

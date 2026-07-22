@@ -1,0 +1,19 @@
+# Gloss downstream provenance. Update this file only in an upstream sync PR.
+[downstream]
+version = "0.6.4+gloss.1"
+runtime_api_version = 1
+
+[upstream]
+repository = "https://github.com/funstory-ai/BabelDOC"
+version = "0.6.4"
+tag = "v0.6.4"
+tag_object = "63a1dff04f2e61c004f8512136745fd2a8564d96"
+commit = "17480db9df92ddcb37349ce34b312335226e8ec9"
+release_url = "https://github.com/funstory-ai/BabelDOC/releases/tag/v0.6.4"
+released_at = "2026-07-16T18:59:52Z"
+tag_verification = "unsigned"
+
+[compatibility_baseline]
+version = "0.6.3"
+tag = "v0.6.3"
+commit = "28f784ca6b437dbba040bfd9c67110373cd0924b"

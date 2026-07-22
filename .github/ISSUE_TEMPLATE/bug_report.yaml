@@ -13,7 +13,7 @@ body:
           required: true
         - label: I confirmed this is not caused by a network issue
           required: true
-        - label: I have fully read and understood the [README](https://github.com/funstory-ai/BabelDOC/blob/main/README.md)
+        - label: I have fully read and understood the [README](https://github.com/SunChJ/BabelDOC/blob/main/README.md) and [downstream scope](https://github.com/SunChJ/BabelDOC/blob/main/DOWNSTREAM.md)
           required: true
         - label: I am certain that this issue is with BabelDOC itself and can be reproduced through the BabelDOC cli
           required: true
@@ -49,7 +49,7 @@ body:
       value: |
         - OS:
         - Python:
-        - BabelDOC:
+        - Gloss BabelDOC runtime:
       render: markdown
     validations:
       required: true

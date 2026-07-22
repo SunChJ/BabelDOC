@@ -14,7 +14,7 @@ body:
       options:
         - label: I have searched existing issues
           required: true
-        - label: I have fully read and understood the [README](https://github.com/funstory-ai/BabelDOC/blob/main/README.md)
+        - label: I have fully read and understood the [README](https://github.com/SunChJ/BabelDOC/blob/main/README.md) and [downstream scope](https://github.com/SunChJ/BabelDOC/blob/main/DOWNSTREAM.md)
           required: true
         - label: This feature is not related to BabelDOC CLI. The CLI is only used for debugging purposes, we do not accept any feature requests related to the CLI.
           required: true

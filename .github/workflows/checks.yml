@@ -2,23 +2,25 @@ name: Checks
 
 on:
   push:
+    branches: ["main"]
   pull_request:
     branches: ["main"]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  checks:
-    name: Package and lightweight PDF smoke
+  quality:
+    name: Quality and PDF smoke
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
 
       - name: Cache BabelDOC assets
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ~/.cache/babeldoc
           key: babeldoc-assets-${{ hashFiles('babeldoc/assets/embedding_assets_metadata.py') }}
@@ -32,18 +34,19 @@ jobs:
           activate-environment: true
 
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --frozen
 
       - name: Lint
         run: uv run ruff check .
 
-      - name: Build package
-        run: uv build
+      - name: Unit tests
+        run: uv run pytest -q
 
-      - name: Import and CLI smoke
-        run: |
-          uv run python -m compileall babeldoc
-          uv run babeldoc --help
+      - name: Build distributions
+        run: uv build --wheel --sdist
+
+      - name: Import smoke
+        run: uv run python -m compileall babeldoc
 
       - name: Lightweight no-secret PDF E2E
         run: |
@@ -53,3 +56,46 @@ jobs:
             --files examples/ci/test.pdf \
             --only-parse-generate-pdf \
             --skip-scanned-detection
+
+  wheel-smoke:
+    name: Wheel smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Setup uv with Python 3.12
+        uses: astral-sh/setup-uv@85856786d1ce8acfbcc2f13a5f3fbd6b938f9f41 # v7.1.2
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Build wheel
+        run: uv build --wheel
+
+      - name: Install wheel into a clean environment
+        shell: bash
+        run: |
+          uv venv --python 3.12 .wheel-venv
+          uv pip install --python .wheel-venv/bin/python dist/*.whl
+
+      - name: Validate runtime handshake
+        shell: bash
+        run: |
+          .wheel-venv/bin/gloss-babeldoc runtime-info --json \
+            | .wheel-venv/bin/python -c '
+          import json
+          import sys
+          from importlib.metadata import version
+
+          payload = json.load(sys.stdin)
+          assert payload["runtime"]["version"] == version("BabelDOC")
+          assert payload["runtime_api_version"] == 1
+          assert payload["upstream"]["version"] == "0.6.4"
+          '
