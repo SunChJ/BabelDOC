@@ -1,7 +1,8 @@
+# Gloss downstream modification: release identity and runtime handshake, 2026-07-21.
 [project]
 name = "BabelDOC"
-version = "0.6.4"
-description = "Yet Another Document Translator"
+version = "0.6.4+gloss.1"
+description = "Gloss-maintained downstream of the BabelDOC document translator"
 license = "AGPL-3.0"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
@@ -9,7 +10,8 @@ authors = [
     { name = "awwaawwa", email = "aw@funstory.ai" }
 ]
 maintainers = [
-    { name = "awwaawwa", email = "aw@funstory.ai" }
+    { name = "awwaawwa", email = "aw@funstory.ai" },
+    { name = "SamsonCJ" },
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -60,11 +62,14 @@ cuda = ["onnxruntime-gpu>=1.16.1"]
 memray = ["memray>=1.17.1"]
 
 [project.urls]
-Homepage = "https://github.com/funstory-ai/BabelDOC"
-Issues = "https://github.com/funstory-ai/BabelDOC/issues"
+Homepage = "https://github.com/SunChJ/BabelDOC"
+Repository = "https://github.com/SunChJ/BabelDOC"
+Issues = "https://github.com/SunChJ/BabelDOC/issues"
+Upstream = "https://github.com/funstory-ai/BabelDOC"
 
 [project.scripts]
 babeldoc = "babeldoc.main:cli"
+gloss-babeldoc = "babeldoc.gloss_cli:cli"
 
 [build-system]
 requires = ["hatchling"]
@@ -164,8 +169,8 @@ pythonpath = [".", "src"]
 testpaths = ["tests"]
 
 [bumpver]
-current_version = "0.6.4"
-version_pattern = "MAJOR.MINOR.PATCH[.PYTAGNUM]"
+current_version = "0.6.4+gloss.1"
+version_pattern = "MAJOR.MINOR.PATCH+gloss.NUM"
 
 [bumpver.file_patterns]
 "pyproject.toml" = [

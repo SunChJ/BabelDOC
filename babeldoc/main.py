@@ -26,7 +26,8 @@ from babeldoc.translator.translator import OpenAITranslator
 from babeldoc.translator.translator import set_translate_rate_limiter
 
 logger = logging.getLogger(__name__)
-__version__ = "0.6.4"
+# Gloss downstream release identity; see DOWNSTREAM.md.
+__version__ = "0.6.4+gloss.1"
 
 
 def create_parser():
