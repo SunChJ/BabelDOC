@@ -42,7 +42,7 @@ wheels = [
 
 [[package]]
 name = "babeldoc"
-version = "0.6.4+gloss.1"
+version = "0.6.4+gloss.2"
 source = { editable = "." }
 dependencies = [
     { name = "bitstring" },
