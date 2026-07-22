@@ -1,7 +1,7 @@
 # Gloss downstream modification: release identity and runtime handshake, 2026-07-21.
 [project]
 name = "BabelDOC"
-version = "0.6.4+gloss.1"
+version = "0.6.4+gloss.2"
 description = "Gloss-maintained downstream of the BabelDOC document translator"
 license = "AGPL-3.0"
 readme = "README.md"
@@ -139,7 +139,6 @@ max-complexity = 10 # 函数圈复杂度阈值
 [tool.ruff.lint.per-file-ignores]
 "babeldoc/babeldoc_exception/BabelDOCException.py" = ["N999"]
 "babeldoc/format/pdf/pdfinterp.py" = ["N"] # 忽略命名规范
-"babeldoc/tools/executor/babeldoc_adapter.py" = ["F401"]
 "babeldoc/tools/executor/server.py" = ["N802"]
 "tests/*" = ["S101"]            # 在测试文件中允许 assert
 "scripts/*/tests/*" = ["S101", "S106"]  # scaffold tests: allow assert + token fixture
@@ -169,7 +168,7 @@ pythonpath = [".", "src"]
 testpaths = ["tests"]
 
 [bumpver]
-current_version = "0.6.4+gloss.1"
+current_version = "0.6.4+gloss.2"
 version_pattern = "MAJOR.MINOR.PATCH+gloss.NUM"
 
 [bumpver.file_patterns]
@@ -185,6 +184,9 @@ version_pattern = "MAJOR.MINOR.PATCH+gloss.NUM"
 ]
 "babeldoc/const.py" = [
     '__version__ = "{version}"'
+]
+"UPSTREAM_BASE.toml" = [
+    'version = "{version}"'
 ]
 
 [tool.pyright]

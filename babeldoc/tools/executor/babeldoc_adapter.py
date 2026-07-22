@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import signal
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
-import pyarrow
 from babeldoc import __version__ as babeldoc_version
 from babeldoc.format.pdf.translation_config import TranslateResult
 from babeldoc.format.pdf.translation_config import TranslationConfig
@@ -59,22 +60,30 @@ def run_babeldoc_request(request: dict[str, Any], progress_send, cancel_recv) ->
         cancel_watcher.start()
 
         result = _run_async_translate(config, emit)
-        logger.info("BabelDOC execution finished: task_id=%s", task_id)
-        emit("result", translate_result_to_payload(result, config))
+        if cancel_state.cancel_requested:
+            emit("cancelled", {"reason": "client_request"})
+        else:
+            logger.info("BabelDOC execution finished: task_id=%s", task_id)
+            emit("result", translate_result_to_payload(result, config))
+    except asyncio.CancelledError:
+        emit("cancelled", {"reason": "client_request"})
     except Exception as exc:
-        logger.exception("BabelDOC execution failed: task_id=%s", task_id)
-        user_message = (
-            exc.message_for_user if isinstance(exc, BabelDocReportedError) else None
-        )
-        emit(
-            "error",
-            {
-                "code": _error_code(exc),
-                "message": _safe_message(exc),
-                "message_for_user": user_message,
-                "details": {"exception_type": exc.__class__.__name__},
-            },
-        )
+        if cancel_state.cancel_requested:
+            emit("cancelled", {"reason": "client_request"})
+        else:
+            logger.exception("BabelDOC execution failed: task_id=%s", task_id)
+            user_message = (
+                exc.message_for_user if isinstance(exc, BabelDocReportedError) else None
+            )
+            emit(
+                "error",
+                {
+                    "code": _error_code(exc),
+                    "message": _safe_message(exc),
+                    "message_for_user": user_message,
+                    "details": {"exception_type": exc.__class__.__name__},
+                },
+            )
     finally:
         if stop_cancel_watcher is not None:
             stop_cancel_watcher.set()
@@ -96,6 +105,19 @@ class _CancelState:
         if config is not None:
             config.cancel_translation()
 
+    def reapply_cancel(self) -> None:
+        with self._lock:
+            if not self._cancel_requested:
+                return
+            config = self._config
+        if config is not None:
+            config.cancel_translation()
+
+    @property
+    def cancel_requested(self) -> bool:
+        with self._lock:
+            return self._cancel_requested
+
     def attach_config(self, config: TranslationConfig) -> None:
         with self._lock:
             self._config = config
@@ -105,14 +127,40 @@ class _CancelState:
 
 
 def _watch_cancel_pipe(cancel_recv, cancel_state: _CancelState, stop_event) -> None:
+    parent_lost = False
     while not stop_event.is_set():
         try:
             if cancel_recv.poll(0.05):
                 cancel_recv.recv()
                 cancel_state.request_cancel()
-                return
+                break
         except (BrokenPipeError, EOFError, OSError):
+            parent_lost = True
+            cancel_state.request_cancel()
+            break
+    hard_exit_at = time.monotonic() + 2.0 if parent_lost else None
+    while True:
+        if stop_event.wait(0.05):
+            if parent_lost:
+                _hard_exit_after_parent_loss()
             return
+        cancel_state.reapply_cancel()
+        if hard_exit_at is not None and time.monotonic() >= hard_exit_at:
+            _hard_exit_after_parent_loss()
+
+
+def _hard_exit_after_parent_loss() -> None:
+    process_id = os.getpid()
+    kill_signal = getattr(signal, "SIGKILL", None)
+    if kill_signal is not None and hasattr(os, "getpgrp") and hasattr(os, "killpg"):
+        try:
+            if os.getpgrp() == process_id:
+                os.killpg(process_id, kill_signal)
+        except OSError:
+            logger.exception(
+                "failed to kill executor worker process group after parent loss"
+            )
+    os._exit(130)
 
 
 def build_translation_config(
@@ -133,6 +181,10 @@ def build_translation_config(
     gateways = _required_object(request, "gateways")
     assets = _optional_object(request, "assets")
     metadata = _optional_object(request, "metadata")
+    no_dual = _required_bool(translation, "no_dual")
+    no_mono = _required_bool(translation, "no_mono")
+    if no_dual and no_mono:
+        raise ValueError("no_dual and no_mono cannot both be true")
 
     started_at = time.monotonic()
     input_file = resolve_file(workroot, _required_str(paths, "input_file"))
@@ -145,11 +197,17 @@ def build_translation_config(
     mark("paths", started_at)
 
     started_at = time.monotonic()
-    qps = _required_int(runtime_limits, "qps")
-    report_interval = _required_number(runtime_limits, "report_interval_seconds")
+    qps = _required_positive_int(runtime_limits, "qps")
+    report_interval = _required_positive_number(
+        runtime_limits,
+        "report_interval_seconds",
+    )
     set_translate_rate_limiter(qps)
 
-    max_pages_per_part = _required_int(runtime_limits, "max_pages_per_part")
+    max_pages_per_part = _required_positive_int(
+        runtime_limits,
+        "max_pages_per_part",
+    )
     split_strategy = TranslationConfig.create_max_pages_per_part_split_strategy(
         max_pages_per_part
     )
@@ -196,8 +254,8 @@ def build_translation_config(
         lang_in=_required_str(translation, "lang_in"),
         lang_out=_required_str(translation, "lang_out"),
         pages=_optional_str(translation, "pages"),
-        no_dual=_required_bool(translation, "no_dual"),
-        no_mono=_required_bool(translation, "no_mono"),
+        no_dual=no_dual,
+        no_mono=no_mono,
         qps=qps,
         doc_layout_model=doc_layout_model,
         skip_clean=_required_bool(translation, "skip_clean"),
@@ -221,7 +279,10 @@ def build_translation_config(
         ocr_workaround=_required_bool(translation, "ocr_workaround"),
         custom_system_prompt=_optional_str(translation, "custom_system_prompt"),
         glossaries=glossaries,
-        pool_max_workers=_required_int(runtime_limits, "pool_max_workers"),
+        pool_max_workers=_required_positive_int(
+            runtime_limits,
+            "pool_max_workers",
+        ),
         auto_extract_glossary=_required_bool(translation, "auto_extract_glossary"),
         auto_enable_ocr_workaround=_required_bool(
             translation, "auto_enable_ocr_workaround"
@@ -238,7 +299,10 @@ def build_translation_config(
             translation, "remove_non_formula_lines"
         ),
         metadata_extra_data=_optional_str(metadata, "metadata_extra_data"),
-        term_pool_max_workers=_required_int(runtime_limits, "term_pool_max_workers"),
+        term_pool_max_workers=_required_positive_int(
+            runtime_limits,
+            "term_pool_max_workers",
+        ),
     )
     mark("translation_config", started_at)
 
@@ -273,21 +337,44 @@ def translate_result_to_payload(
     result: TranslateResult, config: TranslationConfig
 ) -> dict[str, Any]:
     workroot = get_workroot()
-    files = {
-        "mono_pdf": relative_to_workroot(workroot, result.mono_pdf_path),
-        "dual_pdf": relative_to_workroot(workroot, result.dual_pdf_path),
-        "mono_no_watermark_pdf": relative_to_workroot(
-            workroot, result.no_watermark_mono_pdf_path
-        ),
-        "dual_no_watermark_pdf": relative_to_workroot(
-            workroot, result.no_watermark_dual_pdf_path
-        ),
-        "auto_extracted_glossary_csv": relative_to_workroot(
-            workroot, result.auto_extracted_glossary_path
-        ),
+    output_dir = resolve_dir(workroot, str(config.output_dir))
+    if config.no_mono and config.no_dual:
+        raise ValueError("no_dual and no_mono cannot both be true")
+    pdf_paths = {
+        "mono_pdf": result.mono_pdf_path,
+        "dual_pdf": result.dual_pdf_path,
+        "mono_no_watermark_pdf": result.no_watermark_mono_pdf_path,
+        "dual_no_watermark_pdf": result.no_watermark_dual_pdf_path,
     }
+    files = {
+        key: _validated_pdf_result_path(workroot, output_dir, path, key)
+        for key, path in pdf_paths.items()
+        if path is not None
+    }
+    if not files:
+        raise ValueError("BabelDOC result did not contain a PDF")
+    if not config.no_mono and not {
+        "mono_pdf",
+        "mono_no_watermark_pdf",
+    }.intersection(files):
+        raise ValueError("BabelDOC result did not contain the requested mono PDF")
+    if not config.no_dual and not {
+        "dual_pdf",
+        "dual_no_watermark_pdf",
+    }.intersection(files):
+        raise ValueError("BabelDOC result did not contain the requested dual PDF")
+    glossary_path = relative_to_workroot(
+        workroot,
+        result.auto_extracted_glossary_path,
+    )
+    if glossary_path:
+        glossary_file = resolve_file(workroot, glossary_path)
+        _require_inside_output_dir(glossary_file, output_dir, "auto glossary")
+        if glossary_file.suffix.lower() != ".csv":
+            raise ValueError("auto_extracted_glossary_csv is not a CSV")
+        files["auto_extracted_glossary_csv"] = glossary_path
     return {
-        "files": {key: value for key, value in files.items() if value},
+        "files": files,
         "metrics": {
             "time_consume_seconds": _number_or_zero(
                 getattr(result, "total_seconds", None)
@@ -304,6 +391,52 @@ def translate_result_to_payload(
         },
         "pages": _pages_to_string(config),
     }
+
+
+def _validated_pdf_result_path(
+    workroot: Path,
+    output_dir: Path,
+    value: str | Path,
+    field_name: str,
+) -> str:
+    try:
+        path = Path(value).resolve(strict=True)
+        relative_path = relative_to_workroot(workroot, path)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{field_name} is outside the workroot or missing") from exc
+    if relative_path is None or not path.is_file():
+        raise ValueError(f"{field_name} is not a regular file")
+    _require_inside_output_dir(path, output_dir, field_name)
+    if path.suffix.lower() != ".pdf":
+        raise ValueError(f"{field_name} is not a PDF")
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(1024)
+    except OSError as exc:
+        raise ValueError(f"{field_name} is not readable") from exc
+    if b"%PDF-" not in header:
+        raise ValueError(f"{field_name} does not contain a PDF header")
+    try:
+        import pymupdf
+
+        with pymupdf.open(path) as document:
+            if document.page_count < 1:
+                raise ValueError(f"{field_name} contains no pages")
+            document.load_page(0)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"{field_name} is not a readable PDF") from exc
+    return relative_path
+
+
+def _require_inside_output_dir(path: Path, output_dir: Path, field_name: str) -> None:
+    try:
+        path.relative_to(output_dir)
+    except ValueError as exc:
+        raise ValueError(
+            f"{field_name} is outside the execution output directory"
+        ) from exc
 
 
 def _run_async_translate(config: TranslationConfig, emit) -> TranslateResult:
@@ -461,15 +594,15 @@ def _required_bool(root: dict[str, Any], key: str) -> bool:
     raise ValueError(f"{key} must be a boolean")
 
 
-def _required_int(root: dict[str, Any], key: str) -> int:
+def _required_positive_int(root: dict[str, Any], key: str) -> int:
     value = root.get(key)
-    if isinstance(value, int):
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
         return value
-    raise ValueError(f"{key} must be an integer")
+    raise ValueError(f"{key} must be a positive integer")
 
 
-def _required_number(root: dict[str, Any], key: str) -> float:
+def _required_positive_number(root: dict[str, Any], key: str) -> float:
     value = root.get(key)
-    if isinstance(value, int | float):
+    if isinstance(value, int | float) and not isinstance(value, bool) and value > 0:
         return float(value)
-    raise ValueError(f"{key} must be a number")
+    raise ValueError(f"{key} must be a positive number")

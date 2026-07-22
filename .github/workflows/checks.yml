@@ -88,8 +88,9 @@ jobs:
       - name: Validate runtime handshake
         shell: bash
         run: |
-          .wheel-venv/bin/gloss-babeldoc runtime-info --json \
-            | .wheel-venv/bin/python -c '
+          cd "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/.wheel-venv/bin/gloss-babeldoc" runtime-info --json \
+            | "$GITHUB_WORKSPACE/.wheel-venv/bin/python" -c '
           import json
           import sys
           from importlib.metadata import version
@@ -99,3 +100,87 @@ jobs:
           assert payload["runtime_api_version"] == 1
           assert payload["upstream"]["version"] == "0.6.4"
           '
+
+      - name: Validate packaged executor service
+        shell: bash
+        env:
+          BABELDOC_EXECUTOR_ALLOW_FAKE: "1"
+        run: |
+          cd "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/.wheel-venv/bin/python" - <<'PY'
+          import http.client
+          import json
+          import os
+          import secrets
+          import select
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          from babeldoc.tools.executor.babeldoc_adapter import run_babeldoc_request
+
+          del run_babeldoc_request
+          workroot = Path(tempfile.mkdtemp(prefix="gloss-babeldoc-smoke-"))
+          workroot.chmod(0o700)
+          marker = workroot / ".executor-workroot-ready"
+          marker.write_text("ready\n", encoding="utf-8")
+          marker.chmod(0o600)
+          token = secrets.token_urlsafe(32)
+          token_file = workroot / "token"
+          token_file.write_text(token + "\n", encoding="utf-8")
+          token_file.chmod(0o600)
+          executable = Path(sys.executable).with_name("gloss-babeldoc")
+          process = subprocess.Popen(
+              [
+                  str(executable),
+                  "serve",
+                  "--runner",
+                  "fake",
+                  "--work-dir",
+                  str(workroot),
+                  "--token-file",
+                  str(token_file),
+              ],
+              env=os.environ.copy(),
+              stdout=subprocess.PIPE,
+              stderr=subprocess.PIPE,
+              text=True,
+          )
+          try:
+              assert process.stdout is not None
+              readable, _, _ = select.select([process.stdout], [], [], 20)
+              assert readable, "executor service did not report ready"
+              line = process.stdout.readline().strip()
+              prefix = "__GLOSS_BABELDOC_SERVICE_READY__"
+              assert line.startswith(prefix), line
+              ready = json.loads(line.removeprefix(prefix))
+              assert "auth_token" not in ready
+              endpoint = urlparse(ready["endpoint"])
+              connection = http.client.HTTPConnection(
+                  endpoint.hostname,
+                  endpoint.port,
+                  timeout=5,
+              )
+              headers = {"Authorization": f"Bearer {token}"}
+              connection.request("GET", "/healthz", headers=headers)
+              response = connection.getresponse()
+              health = json.loads(response.read())
+              assert response.status == 200 and health["ok"] is True
+              connection.request(
+                  "POST",
+                  "/v1/shutdown",
+                  body=b"{}",
+                  headers={**headers, "Content-Type": "application/json"},
+              )
+              response = connection.getresponse()
+              response.read()
+              connection.close()
+              assert response.status == 202
+              assert process.wait(timeout=10) == 0
+          finally:
+              if process.poll() is None:
+                  process.kill()
+                  process.wait(timeout=5)
+          PY
