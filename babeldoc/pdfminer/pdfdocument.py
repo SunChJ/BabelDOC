@@ -386,8 +386,9 @@ class PDFStandardSecurityHandler:
             # Algorithm 3.5
             # ISO 32000-1 Algorithm 3.5 mandates MD5 for this legacy PDF format;
             # this is file-format compatibility, not application password storage.
-            # codeql[py/weak-sensitive-data-hashing]
-            hash = md5(self.PASSWORD_PADDING)
+            hash = md5(  # lgtm[py/weak-sensitive-data-hashing]
+                self.PASSWORD_PADDING
+            )
             hash.update(self.docid[0])  # 3
             result = Arcfour(key).encrypt(hash.digest())  # 4
             for i in range(1, 20):  # 5
@@ -400,8 +401,7 @@ class PDFStandardSecurityHandler:
         # Algorithm 3.2
         password = (password + self.PASSWORD_PADDING)[:32]  # 1
         # ISO 32000-1 Algorithm 3.2 mandates MD5 for legacy PDF key derivation.
-        # codeql[py/weak-sensitive-data-hashing]
-        hash = md5(password)
+        hash = md5(password)  # lgtm[py/weak-sensitive-data-hashing]
         hash.update(self.o)  # 3
         # See https://github.com/pdfminer/pdfminer.six/issues/186
         hash.update(struct.pack("<L", self.p))  # 4
