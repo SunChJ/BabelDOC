@@ -722,7 +722,7 @@ class HTMLConverter(PDFConverter[AnyIO]):
 
 
 class XMLConverter(PDFConverter[AnyIO]):
-    CONTROL = re.compile("[\x00-\x08\x0b-\x0c\x0e-\x1f]")
+    CONTROL = re.compile(r"[\x00-\x08\x0b-\x0c\x0e-\x1f]")
 
     def __init__(
         self,

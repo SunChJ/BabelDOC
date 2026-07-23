@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import hashlib
 import json
 import logging
@@ -318,7 +319,14 @@ async def get_font_and_metadata_async(
     return cache_file_path, font_metadata[font_file_name]
 
 
+@functools.cache
 def get_font_and_metadata(font_file_name: str):
+    """Return one verified font resource without repeating disk/network lookup.
+
+    A translation can request the same fallback font from many paragraphs.
+    The returned path and embedded metadata are immutable runtime assets, so a
+    process-local cache avoids re-hashing the same font for every lookup.
+    """
     return run_coro(get_font_and_metadata_async(font_file_name))
 
 

@@ -15,6 +15,7 @@ from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.format.pdf.translation_config import WatermarkOutputMode
 from babeldoc.glossary import Glossary
 from babeldoc.progress_monitor import ProgressMonitor
+from babeldoc.tools.executor.layout_ir_cache import LayoutIRCache
 from babeldoc.tools.executor.translator import ExecutorTranslator
 from babeldoc.tools.executor.workroot import get_workroot
 from babeldoc.tools.executor.workroot import relative_to_workroot
@@ -23,10 +24,81 @@ from babeldoc.tools.executor.workroot import resolve_file
 from babeldoc.translator.translator import set_translate_rate_limiter
 
 logger = logging.getLogger(__name__)
+_TIMED_PHASES = (
+    "launching",
+    "parsing",
+    "translating",
+    "typesetting",
+    "saving",
+    "finalizing",
+)
+
+
+class ExecutionTelemetry:
+    """Accumulate monotonic executor phase timings for progress and results."""
+
+    def __init__(self, *, clock_ns=time.monotonic_ns):
+        self._clock_ns = clock_ns
+        self._started_at = clock_ns()
+        self._phase_started_at = self._started_at
+        self._phase = "launching"
+        self._completed_ns = dict.fromkeys(_TIMED_PHASES, 0)
+
+    def observe(
+        self,
+        event: dict[str, Any],
+        config: TranslationConfig,
+    ) -> dict[str, Any]:
+        phase = _phase_for_stage(event.get("stage"))
+        if event.get("type") in {
+            "progress_start",
+            "progress_update",
+            "progress_end",
+        }:
+            self.transition(phase)
+        payload = dict(event)
+        payload["performance"] = self.snapshot(config)
+        return payload
+
+    def transition(self, phase: str) -> None:
+        if phase == self._phase:
+            return
+        if phase not in {*_TIMED_PHASES, "completed"}:
+            raise ValueError(f"unknown executor telemetry phase: {phase}")
+        now = self._clock_ns()
+        if self._phase in self._completed_ns:
+            self._completed_ns[self._phase] += max(0, now - self._phase_started_at)
+        self._phase = phase
+        self._phase_started_at = now
+
+    def snapshot(
+        self,
+        config: TranslationConfig | None = None,
+    ) -> dict[str, Any]:
+        now = self._clock_ns()
+        timings = dict(self._completed_ns)
+        if self._phase in timings:
+            timings[self._phase] += max(0, now - self._phase_started_at)
+        cache = getattr(config, "layout_ir_cache", None)
+        return {
+            "schema_version": 1,
+            "phase": self._phase,
+            "elapsed_milliseconds": _ns_to_milliseconds(now - self._started_at),
+            "phase_timings_milliseconds": {
+                phase: _ns_to_milliseconds(timings[phase]) for phase in _TIMED_PHASES
+            },
+            "layout_ir_cache_status": getattr(cache, "status", "disabled"),
+        }
+
+    def finish(self, config: TranslationConfig) -> dict[str, Any]:
+        self.transition("completed")
+        return self.snapshot(config)
 
 
 def run_babeldoc_request(request: dict[str, Any], progress_send, cancel_recv) -> None:
+    telemetry = ExecutionTelemetry()
     cancel_state = _CancelState()
+    config: TranslationConfig | None = None
     stop_cancel_watcher: threading.Event | None = None
     cancel_watcher: threading.Thread | None = None
     task_id = _task_id(request)
@@ -59,12 +131,14 @@ def run_babeldoc_request(request: dict[str, Any], progress_send, cancel_recv) ->
         )
         cancel_watcher.start()
 
-        result = _run_async_translate(config, emit)
+        result = _run_async_translate(config, emit, telemetry)
         if cancel_state.cancel_requested:
             emit("cancelled", {"reason": "client_request"})
         else:
             logger.info("BabelDOC execution finished: task_id=%s", task_id)
-            emit("result", translate_result_to_payload(result, config))
+            payload = translate_result_to_payload(result, config)
+            payload["performance"] = telemetry.finish(config)
+            emit("result", payload)
     except asyncio.CancelledError:
         emit("cancelled", {"reason": "client_request"})
     except Exception as exc:
@@ -82,6 +156,7 @@ def run_babeldoc_request(request: dict[str, Any], progress_send, cancel_recv) ->
                     "message": _safe_message(exc),
                     "message_for_user": user_message,
                     "details": {"exception_type": exc.__class__.__name__},
+                    "performance": telemetry.snapshot(config),
                 },
             )
     finally:
@@ -244,6 +319,14 @@ def build_translation_config(
     mark("glossaries", started_at)
 
     started_at = time.monotonic()
+    layout_ir_cache = _create_layout_ir_cache(
+        workroot,
+        assets,
+        max_pages_per_part=max_pages_per_part,
+    )
+    mark("layout_ir_cache", started_at)
+
+    started_at = time.monotonic()
     config = TranslationConfig(
         input_file=str(input_file),
         output_dir=str(output_dir),
@@ -304,6 +387,7 @@ def build_translation_config(
             "term_pool_max_workers",
         ),
     )
+    config.layout_ir_cache = layout_ir_cache
     mark("translation_config", started_at)
 
     started_at = time.monotonic()
@@ -312,7 +396,7 @@ def build_translation_config(
 
     total_elapsed = time.monotonic() - total_started_at
     logger.info(
-        "BabelDOC config timing: task_id=%s total=%.3fs paths=%.3fs limits=%.3fs main_translator=%.3fs term_translator=%.3fs layout_model=%.3fs glossaries=%.3fs translation_config=%.3fs font_mapper=%.3fs glossary_count=%s",
+        "BabelDOC config timing: task_id=%s total=%.3fs paths=%.3fs limits=%.3fs main_translator=%.3fs term_translator=%.3fs layout_model=%.3fs glossaries=%.3fs layout_ir_cache=%.3fs translation_config=%.3fs font_mapper=%.3fs glossary_count=%s",
         task_id or _task_id(request),
         total_elapsed,
         timing.get("paths", 0.0),
@@ -321,6 +405,7 @@ def build_translation_config(
         timing.get("term_translator", 0.0),
         timing.get("layout_model", 0.0),
         timing.get("glossaries", 0.0),
+        timing.get("layout_ir_cache", 0.0),
         timing.get("translation_config", 0.0),
         timing.get("font_mapper", 0.0),
         len(glossaries),
@@ -439,15 +524,22 @@ def _require_inside_output_dir(path: Path, output_dir: Path, field_name: str) ->
         ) from exc
 
 
-def _run_async_translate(config: TranslationConfig, emit) -> TranslateResult:
+def _run_async_translate(
+    config: TranslationConfig,
+    emit,
+    telemetry: ExecutionTelemetry,
+) -> TranslateResult:
     from babeldoc.format.pdf import high_level
 
     emit(
         "progress",
-        {
-            "type": "babeldoc_version",
-            "version": babeldoc_version,
-        },
+        telemetry.observe(
+            {
+                "type": "babeldoc_version",
+                "version": babeldoc_version,
+            },
+            config,
+        ),
     )
 
     async def run() -> TranslateResult:
@@ -456,6 +548,7 @@ def _run_async_translate(config: TranslationConfig, emit) -> TranslateResult:
             if event_type == "finish":
                 result = event.get("translate_result")
                 if isinstance(result, TranslateResult):
+                    telemetry.transition("finalizing")
                     return result
                 raise ValueError("BabelDOC finish event did not contain result")
             if event_type == "error":
@@ -463,10 +556,57 @@ def _run_async_translate(config: TranslationConfig, emit) -> TranslateResult:
                     str(event.get("error")),
                     event.get("message_for_user"),
                 )
-            emit("progress", dict(event))
+            emit("progress", telemetry.observe(dict(event), config))
         raise RuntimeError("BabelDOC async_translate ended without finish event")
 
     return asyncio.run(run())
+
+
+def _create_layout_ir_cache(
+    workroot: Path,
+    assets: dict[str, Any],
+    *,
+    max_pages_per_part: int,
+) -> LayoutIRCache | None:
+    raw_options = assets.get("layout_ir_cache")
+    if raw_options is None:
+        return None
+    if not isinstance(raw_options, dict):
+        raise ValueError("assets.layout_ir_cache must be an object")
+    enabled = raw_options.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("assets.layout_ir_cache.enabled must be a boolean")
+    if not enabled:
+        return None
+    cache_root = resolve_dir(
+        workroot,
+        ".cache/layout-ir",
+        create=True,
+    )
+    cache_root.chmod(0o700)
+    return LayoutIRCache(
+        cache_root,
+        max_pages_per_part=max_pages_per_part,
+    )
+
+
+def _phase_for_stage(value: object) -> str:
+    stage = value.lower() if isinstance(value, str) else ""
+    if "translate paragraph" in stage or "term extraction" in stage:
+        return "translating"
+    if (
+        "typesetting" in stage
+        or "add fonts" in stage
+        or "drawing instructions" in stage
+    ):
+        return "typesetting"
+    if "subset font" in stage or "save pdf" in stage:
+        return "saving"
+    return "parsing"
+
+
+def _ns_to_milliseconds(value: int) -> int:
+    return max(0, value) // 1_000_000
 
 
 class BabelDocReportedError(RuntimeError):

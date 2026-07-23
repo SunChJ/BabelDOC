@@ -820,6 +820,19 @@ def fix_media_box(doc: Document) -> None:
     return mediabox_data
 
 
+def _complete_cached_stage(
+    translation_config: TranslationConfig,
+    stage_name: str,
+    total: int,
+) -> None:
+    """Keep progress monotonic when a cached preprocessing stage is skipped."""
+    monitor = translation_config.progress_monitor
+    if monitor is None or stage_name not in monitor.stage:
+        return
+    with monitor.stage_start(stage_name, max(1, total)):
+        pass
+
+
 def check_cid_char(il: il_version_1.Document):
     chars = []
     for page in il.page:
@@ -898,18 +911,33 @@ def _do_translate_single(
     #         raise ScannedPDFError("Scanned PDF detected.")
 
     xml_converter = XMLConverter()
-    logger.debug(f"start parse il from {temp_pdf_path}")
-    from babeldoc.format.pdf.new_parser.native_parse import (
-        parse_prepared_pdf_with_new_parser_to_legacy_ir,
+    layout_ir_cache = getattr(translation_config, "layout_ir_cache", None)
+    docs = (
+        layout_ir_cache.load(translation_config, doc_pdf2zh)
+        if layout_ir_cache is not None
+        else None
     )
+    layout_ir_cache_hit = docs is not None
+    if layout_ir_cache_hit:
+        _complete_cached_stage(
+            translation_config,
+            "Parse PDF and Create Intermediate Representation",
+            len(docs.page),
+        )
+        logger.info("reused cached layout IR for %s", original_pdf_path)
+    else:
+        logger.debug(f"start parse il from {temp_pdf_path}")
+        from babeldoc.format.pdf.new_parser.native_parse import (
+            parse_prepared_pdf_with_new_parser_to_legacy_ir,
+        )
 
-    docs = parse_prepared_pdf_with_new_parser_to_legacy_ir(
-        temp_pdf_path,
-        config=translation_config,
-        doc_pdf=doc_pdf2zh,
-    )
-    logger.debug(f"finish parse il from {temp_pdf_path}")
-    logger.debug(f"finish create il from {temp_pdf_path}")
+        docs = parse_prepared_pdf_with_new_parser_to_legacy_ir(
+            temp_pdf_path,
+            config=translation_config,
+            doc_pdf=doc_pdf2zh,
+        )
+        logger.debug(f"finish parse il from {temp_pdf_path}")
+        logger.debug(f"finish create il from {temp_pdf_path}")
     if translation_config.only_include_translated_page and not docs.page:
         return None
 
@@ -949,39 +977,58 @@ def _do_translate_single(
                 translation_config.get_working_file_path("detect_scanned_file.json"),
             )
 
-    # Generate layouts for all pages
-    logger.debug("start generating layouts")
-    docs = LayoutParser(translation_config).process(docs, doc_pdf2zh)
-    logger.debug("finish generating layouts")
-    close_process_pool()
-    if translation_config.debug:
-        xml_converter.write_json(
-            docs,
-            translation_config.get_working_file_path("layout_generator.json"),
+    if layout_ir_cache_hit:
+        _complete_cached_stage(
+            translation_config,
+            LayoutParser.stage_name,
+            len(docs.page) * 2,
         )
-
-    if translation_config.table_model:
-        docs = TableParser(translation_config).process(docs, doc_pdf2zh)
-        logger.debug("finish table parser")
+        _complete_cached_stage(
+            translation_config,
+            ParagraphFinder.stage_name,
+            len(docs.page),
+        )
+        _complete_cached_stage(
+            translation_config,
+            StylesAndFormulas.stage_name,
+            len(docs.page),
+        )
+    else:
+        # Generate layouts for all pages
+        logger.debug("start generating layouts")
+        docs = LayoutParser(translation_config).process(docs, doc_pdf2zh)
+        logger.debug("finish generating layouts")
+        close_process_pool()
         if translation_config.debug:
             xml_converter.write_json(
                 docs,
-                translation_config.get_working_file_path("table_parser.json"),
+                translation_config.get_working_file_path("layout_generator.json"),
             )
-    ParagraphFinder(translation_config).process(docs)
-    logger.debug(f"finish paragraph finder from {temp_pdf_path}")
-    if translation_config.debug:
-        xml_converter.write_json(
-            docs,
-            translation_config.get_working_file_path("paragraph_finder.json"),
-        )
-    StylesAndFormulas(translation_config).process(docs)
-    logger.debug(f"finish styles and formulas from {temp_pdf_path}")
-    if translation_config.debug:
-        xml_converter.write_json(
-            docs,
-            translation_config.get_working_file_path("styles_and_formulas.json"),
-        )
+
+        if translation_config.table_model:
+            docs = TableParser(translation_config).process(docs, doc_pdf2zh)
+            logger.debug("finish table parser")
+            if translation_config.debug:
+                xml_converter.write_json(
+                    docs,
+                    translation_config.get_working_file_path("table_parser.json"),
+                )
+        ParagraphFinder(translation_config).process(docs)
+        logger.debug(f"finish paragraph finder from {temp_pdf_path}")
+        if translation_config.debug:
+            xml_converter.write_json(
+                docs,
+                translation_config.get_working_file_path("paragraph_finder.json"),
+            )
+        StylesAndFormulas(translation_config).process(docs)
+        logger.debug(f"finish styles and formulas from {temp_pdf_path}")
+        if translation_config.debug:
+            xml_converter.write_json(
+                docs,
+                translation_config.get_working_file_path("styles_and_formulas.json"),
+            )
+        if layout_ir_cache is not None:
+            layout_ir_cache.store(docs, translation_config)
 
     translate_engine = translation_config.translator
     term_extraction_engine = translation_config.get_term_extraction_translator()

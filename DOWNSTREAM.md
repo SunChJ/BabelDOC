@@ -38,6 +38,10 @@ Downstream builds are distributed through GitHub Releases or a Gloss-managed
 runtime manifest. They are not published to the public PyPI project owned by
 upstream. Every binary release must link to its exact source tag and include
 artifact checksums, dependency/build inputs, license notices, and provenance.
+The runtime manifest is signed with the dedicated Ed25519 release key; Gloss
+pins the corresponding public key and rejects missing or invalid signatures.
+macOS releases include native arm64 and x86_64 self-contained archives, so an
+end user does not need to install Python or BabelDOC separately.
 
 ## Upstream synchronization
 

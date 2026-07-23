@@ -20,6 +20,7 @@ from babeldoc.tools.executor import server as executor_server
 from babeldoc.tools.executor.protocol import EventEnvelope
 from babeldoc.tools.executor.runner import FakeExecutionRunner
 from babeldoc.tools.executor.server import ALLOW_FAKE_RUNNER_ENV
+from babeldoc.tools.executor.server import EVENT_HEARTBEAT_INTERVAL_SECONDS
 from babeldoc.tools.executor.server import MAX_JSON_BODY_BYTES
 from babeldoc.tools.executor.server import READY_PREFIX
 from babeldoc.tools.executor.server import ExecutorHandler
@@ -98,7 +99,7 @@ class GapDuringStreamStore:
     def replay(self, _execution_id: str, _after_sequence: int) -> list:
         return []
 
-    def stream(self, execution_id: str, _after_sequence: int):
+    def stream(self, execution_id: str, _after_sequence: int, **_kwargs):
         yield EventEnvelope(
             type="progress",
             execution_id=execution_id,
@@ -126,7 +127,7 @@ class EvictedDuringStreamStore:
     def replay(self, _execution_id: str, _after_sequence: int) -> list:
         return []
 
-    def stream(self, execution_id: str, _after_sequence: int):
+    def stream(self, execution_id: str, _after_sequence: int, **_kwargs):
         yield EventEnvelope(
             type="progress",
             execution_id=execution_id,
@@ -198,6 +199,7 @@ def running_server(
     workroot: Path | None = None,
     parent_pid: int | None = None,
     parent_start_time: float | None = None,
+    event_heartbeat_interval_seconds: float = (EVENT_HEARTBEAT_INTERVAL_SECONDS),
 ) -> Iterator[tuple[ExecutorServer, threading.Thread]]:
     previous_workroot = os.environ.get(WORKROOT_ENV)
     os.environ[WORKROOT_ENV] = str(tmp_path)
@@ -212,6 +214,7 @@ def running_server(
         workroot=workroot,
         parent_pid=parent_pid,
         parent_start_time=parent_start_time,
+        event_heartbeat_interval_seconds=event_heartbeat_interval_seconds,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -443,6 +446,67 @@ def test_stream_gap_emits_an_unsequenced_control_record(tmp_path: Path) -> None:
     assert records[1]["sequence"] is None
     assert records[1]["payload"]["code"] == "replay_gap"
     assert records[1]["payload"]["after_sequence"] == 11
+
+
+def test_quiet_stream_emits_repeated_unsequenced_heartbeats(
+    tmp_path: Path,
+) -> None:
+    with running_server(
+        tmp_path,
+        event_heartbeat_interval_seconds=0.02,
+    ) as (server, _thread):
+        status, _headers, created = json_request(
+            server,
+            "POST",
+            "/v1/executions",
+            body={"task_id": "quiet-heartbeat", "mode": "block"},
+        )
+        assert status == 201
+        execution_id = created["execution_id"]
+        connection = http.client.HTTPConnection(
+            *server.server_address[:2],
+            timeout=1,
+        )
+        try:
+            connection.request(
+                "GET",
+                f"/v1/executions/{execution_id}/events"
+                f"?after_sequence={created['initial_sequence']}",
+                headers={"Authorization": f"Bearer {server.token}"},
+            )
+            response = connection.getresponse()
+            assert response.status == 200
+            heartbeats = [
+                json.loads(response.readline()),
+                json.loads(response.readline()),
+            ]
+
+            assert [record["type"] for record in heartbeats] == [
+                "heartbeat",
+                "heartbeat",
+            ]
+            assert all(record["schema_version"] == 1 for record in heartbeats)
+            assert all(
+                record["service_id"] == "gloss-babeldoc" for record in heartbeats
+            )
+            assert all(
+                record["instance_id"] == "test-instance" for record in heartbeats
+            )
+            assert all(record["execution_id"] == execution_id for record in heartbeats)
+            assert all(record["sequence"] is None for record in heartbeats)
+            assert all(record["payload"] == {} for record in heartbeats)
+            assert all(isinstance(record["emitted_at"], float) for record in heartbeats)
+            assert heartbeats[1]["emitted_at"] >= heartbeats[0]["emitted_at"]
+            assert (
+                server.store.replay(
+                    execution_id,
+                    created["initial_sequence"],
+                )
+                == []
+            )
+        finally:
+            connection.close()
+            server.store.cancel(execution_id)
 
 
 def test_stream_eviction_emits_control_record_with_nullable_snapshot(

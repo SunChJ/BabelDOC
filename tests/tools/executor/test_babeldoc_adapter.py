@@ -13,6 +13,7 @@ import pymupdf
 import pytest
 from babeldoc.format.pdf.translation_config import TranslateResult
 from babeldoc.tools.executor import babeldoc_adapter
+from babeldoc.tools.executor.babeldoc_adapter import ExecutionTelemetry
 from babeldoc.tools.executor.babeldoc_adapter import build_translation_config
 from babeldoc.tools.executor.babeldoc_adapter import run_babeldoc_request
 from babeldoc.tools.executor.babeldoc_adapter import translate_result_to_payload
@@ -125,7 +126,10 @@ def _complete_execution_request(api_key: str) -> dict[str, Any]:
                 "requires_line_extraction": False,
             },
         },
-        "assets": {"glossaries": []},
+        "assets": {
+            "glossaries": [],
+            "layout_ir_cache": {"enabled": True},
+        },
         "metadata": {"metadata_extra_data": None},
     }
 
@@ -177,6 +181,9 @@ def test_complete_execution_request_builds_translation_config(
         assert config.disable_rich_text_translate is True
         assert config.translator.api_key == api_key
         assert config.doc_layout_model.host == "http://127.0.0.1:2"
+        assert config.layout_ir_cache is not None
+        assert config.layout_ir_cache.root == workroot / ".cache" / "layout-ir"
+        assert config.layout_ir_cache.root.stat().st_mode & 0o777 == 0o700
     finally:
         config.translator._client.close()
         config.term_extraction_translator._client.close()
@@ -447,7 +454,7 @@ def test_adapter_emits_cancelled_terminal_for_async_cancellation(
         lambda _request, **_kwargs: _config(),
     )
 
-    def cancel(_config, _emit):
+    def cancel(_config, _emit, _telemetry):
         raise asyncio.CancelledError
 
     monkeypatch.setattr(babeldoc_adapter, "_run_async_translate", cancel)
@@ -498,7 +505,7 @@ def test_parent_pipe_eof_requests_cooperative_cancellation(
         lambda _request, **_kwargs: config,
     )
 
-    def wait_for_cancel(_config, _emit):
+    def wait_for_cancel(_config, _emit, _telemetry):
         assert cancelled.wait(timeout=1)
         raise asyncio.CancelledError
 
@@ -520,3 +527,78 @@ def test_parent_pipe_eof_requests_cooperative_cancellation(
         "payload": {"reason": "client_request"},
     }
     assert hard_exit_requested.wait(timeout=1)
+
+
+def test_execution_telemetry_accumulates_repeated_phases() -> None:
+    class Clock:
+        now = 0
+
+        def __call__(self) -> int:
+            return self.now
+
+        def advance_ms(self, milliseconds: int) -> None:
+            self.now += milliseconds * 1_000_000
+
+    clock = Clock()
+    telemetry = ExecutionTelemetry(clock_ns=clock)
+    config = _config()
+    config.layout_ir_cache = SimpleNamespace(status="hit")
+
+    clock.advance_ms(5)
+    parsing = telemetry.observe(
+        {
+            "type": "progress_start",
+            "stage": "Parse PDF and Create Intermediate Representation",
+        },
+        config,
+    )
+    clock.advance_ms(7)
+    telemetry.observe(
+        {
+            "type": "progress_start",
+            "stage": "Translate Paragraphs",
+        },
+        config,
+    )
+    clock.advance_ms(11)
+    telemetry.transition("parsing")
+    clock.advance_ms(3)
+    telemetry.transition("finalizing")
+    clock.advance_ms(13)
+    completed = telemetry.finish(config)
+
+    assert parsing["performance"]["phase"] == "parsing"
+    assert completed == {
+        "schema_version": 1,
+        "phase": "completed",
+        "elapsed_milliseconds": 39,
+        "phase_timings_milliseconds": {
+            "launching": 5,
+            "parsing": 10,
+            "translating": 11,
+            "typesetting": 0,
+            "saving": 0,
+            "finalizing": 13,
+        },
+        "layout_ir_cache_status": "hit",
+    }
+
+
+@pytest.mark.parametrize("invalid_value", [1, "true", [], None])
+def test_layout_ir_cache_enabled_must_be_boolean(
+    invalid_value: object,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workroot = tmp_path / "workroot"
+    workroot.mkdir()
+    (workroot / "input.pdf").write_bytes(b"fixture")
+    monkeypatch.setenv(WORKROOT_ENV, str(workroot))
+    request = _complete_execution_request(secrets.token_urlsafe(32))
+    request["assets"]["layout_ir_cache"]["enabled"] = invalid_value
+
+    with pytest.raises(
+        ValueError,
+        match="assets.layout_ir_cache.enabled must be a boolean",
+    ):
+        build_translation_config(request)
