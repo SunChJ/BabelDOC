@@ -18,8 +18,8 @@ from scripts.release.runtime_manifest import write_json
 from scripts.release.sign_manifest import sign_manifest
 from scripts.release.sign_manifest import verify_manifest
 
-VERSION = "0.6.4+gloss.3"
-TAG_VERSION = "0.6.4-gloss.3"
+VERSION = "0.6.4+gloss.4"
+TAG_VERSION = "0.6.4-gloss.4"
 SOURCE_DATE_EPOCH = 1_750_000_000
 
 

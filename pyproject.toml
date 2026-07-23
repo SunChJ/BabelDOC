@@ -1,7 +1,7 @@
 # Gloss downstream modification: release identity and runtime handshake, 2026-07-21.
 [project]
 name = "BabelDOC"
-version = "0.6.4+gloss.3"
+version = "0.6.4+gloss.4"
 description = "Gloss-maintained downstream of the BabelDOC document translator"
 license = "AGPL-3.0"
 readme = "README.md"
@@ -170,7 +170,7 @@ pythonpath = [".", "src"]
 testpaths = ["tests"]
 
 [bumpver]
-current_version = "0.6.4+gloss.3"
+current_version = "0.6.4+gloss.4"
 version_pattern = "MAJOR.MINOR.PATCH+gloss.NUM"
 
 [bumpver.file_patterns]

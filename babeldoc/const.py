@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 
 # Gloss downstream release identity; see DOWNSTREAM.md.
-__version__ = "0.6.4+gloss.3"
+__version__ = "0.6.4+gloss.4"
 
 CACHE_FOLDER = Path.home() / ".cache" / "babeldoc"
 
