@@ -19,8 +19,8 @@ on those mandated operations record that reviewed exception without disabling
 the query for other code.
 
 Suppressions use CodeQL's otherwise-empty preceding-line form. The two legacy
-MD5 results that CodeQL reports with column-scoped locations use its supported
-inline `lgtm[py/weak-sensitive-data-hashing]` form instead.
+MD5 results that CodeQL reports with column-scoped locations use its supported,
+line-scoped `noqa` form instead.
 Control characters removed by the XML converter are expressed with explicit
 raw-string hexadecimal ranges so scanners and reviewers see the intended XML
 1.0 character set unambiguously.

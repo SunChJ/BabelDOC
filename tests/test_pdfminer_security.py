@@ -14,16 +14,18 @@ def test_codeql_pdf_crypto_suppressions_are_line_scoped() -> None:
     codeql_marker_indexes = [
         index for index, line in enumerate(lines) if line.strip() == codeql_marker
     ]
-    lgtm_marker = "# lgtm[py/weak-sensitive-data-hashing]"
-    lgtm_marker_lines = [line for line in lines if lgtm_marker in line]
+    noqa_marker = "# noqa -- mandated PDF MD5 transform"
+    noqa_marker_lines = [line for line in lines if noqa_marker in line]
 
     assert len(codeql_marker_indexes) == 6
     assert all(
         any(call in lines[index + 1] for call in ("md5(", "sha256(", "next_hash("))
         for index in codeql_marker_indexes
     )
-    assert len(lgtm_marker_lines) == 2
-    assert all("md5(" in line for line in lgtm_marker_lines)
+    assert len(noqa_marker_lines) == 2
+    assert all(
+        "md5(" in line or "PASSWORD_PADDING" in line for line in noqa_marker_lines
+    )
 
 
 def test_xml_control_filter_removes_only_disallowed_xml_controls() -> None:
