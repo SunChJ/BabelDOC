@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - "v*"
+  pull_request:
+    branches: ["main"]
   workflow_dispatch:
 
 permissions:
@@ -25,6 +27,7 @@ jobs:
       - name: Checkout release source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Setup uv with Python 3.12
@@ -49,6 +52,8 @@ jobs:
             test "$actual_tag" = "$expected_tag"
             test "$GITHUB_REF_TYPE" = "tag"
             test "$GITHUB_REF_NAME" = "$expected_tag"
+            git show-ref --verify --quiet refs/remotes/origin/main
+            git merge-base --is-ancestor HEAD refs/remotes/origin/main
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "source_date_epoch=$(git show -s --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
@@ -87,7 +92,7 @@ jobs:
   publish:
     name: Sign, attest, and publish
     needs: macos-runtime
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       attestations: write
@@ -97,6 +102,7 @@ jobs:
       - name: Checkout release source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Setup uv with Python 3.12
@@ -117,6 +123,8 @@ jobs:
           test "$actual_tag" = "$expected_tag"
           test "$GITHUB_REF_TYPE" = "tag"
           test "$GITHUB_REF_NAME" = "$expected_tag"
+          git show-ref --verify --quiet refs/remotes/origin/main
+          git merge-base --is-ancestor HEAD refs/remotes/origin/main
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$expected_tag" >> "$GITHUB_OUTPUT"
           echo "tag_version=${version/+/-}" >> "$GITHUB_OUTPUT"
