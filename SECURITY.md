@@ -18,6 +18,8 @@ would make valid PDFs unreadable. The narrow
 `codeql[py/weak-sensitive-data-hashing]` comments on those mandated operations
 record that reviewed exception without disabling the query for other code.
 
+Each suppression is an otherwise-empty comment line immediately before the
+mandated hash operation, which is the source-level form recognized by CodeQL.
 Control characters removed by the XML converter are expressed with explicit
 raw-string hexadecimal ranges so scanners and reviewers see the intended XML
 1.0 character set unambiguously.

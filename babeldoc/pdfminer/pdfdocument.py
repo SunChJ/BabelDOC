@@ -386,7 +386,8 @@ class PDFStandardSecurityHandler:
             # Algorithm 3.5
             # ISO 32000-1 Algorithm 3.5 mandates MD5 for this legacy PDF format;
             # this is file-format compatibility, not application password storage.
-            hash = md5(self.PASSWORD_PADDING)  # codeql[py/weak-sensitive-data-hashing]
+            # codeql[py/weak-sensitive-data-hashing]
+            hash = md5(self.PASSWORD_PADDING)
             hash.update(self.docid[0])  # 3
             result = Arcfour(key).encrypt(hash.digest())  # 4
             for i in range(1, 20):  # 5
@@ -399,7 +400,8 @@ class PDFStandardSecurityHandler:
         # Algorithm 3.2
         password = (password + self.PASSWORD_PADDING)[:32]  # 1
         # ISO 32000-1 Algorithm 3.2 mandates MD5 for legacy PDF key derivation.
-        hash = md5(password)  # codeql[py/weak-sensitive-data-hashing]
+        # codeql[py/weak-sensitive-data-hashing]
+        hash = md5(password)
         hash.update(self.o)  # 3
         # See https://github.com/pdfminer/pdfminer.six/issues/186
         hash.update(struct.pack("<L", self.p))  # 4
@@ -412,9 +414,8 @@ class PDFStandardSecurityHandler:
         if self.r >= 3:
             n = self.length // 8
             for _ in range(50):
-                result = md5(  # codeql[py/weak-sensitive-data-hashing]
-                    result[:n]
-                ).digest()
+                # codeql[py/weak-sensitive-data-hashing]
+                result = md5(result[:n]).digest()
         return result[:n]
 
     def authenticate(self, password: str) -> bytes | None:
@@ -442,12 +443,12 @@ class PDFStandardSecurityHandler:
         # Algorithm 3.7
         password = (password + self.PASSWORD_PADDING)[:32]
         # ISO 32000-1 Algorithm 3.7 mandates MD5 for owner-password recovery.
-        hash = md5(password)  # codeql[py/weak-sensitive-data-hashing]
+        # codeql[py/weak-sensitive-data-hashing]
+        hash = md5(password)
         if self.r >= 3:
             for _ in range(50):
-                hash = md5(  # codeql[py/weak-sensitive-data-hashing]
-                    hash.digest()
-                )
+                # codeql[py/weak-sensitive-data-hashing]
+                hash = md5(hash.digest())
         n = 5
         if self.r >= 3:
             n = self.length // 8
@@ -622,7 +623,8 @@ class PDFStandardSecurityHandlerV5(PDFStandardSecurityHandlerV4):
     ) -> bytes:
         """Compute the password for revision 5"""
         # ISO 32000-2 Algorithm 2.B mandates this exact revision-5 transform.
-        hash = sha256(password)  # codeql[py/weak-sensitive-data-hashing]
+        # codeql[py/weak-sensitive-data-hashing]
+        hash = sha256(password)
         hash.update(salt)
         if vector is not None:
             hash.update(vector)
@@ -636,7 +638,8 @@ class PDFStandardSecurityHandlerV5(PDFStandardSecurityHandlerV4):
     ) -> bytes:
         """Compute the password for revision 6"""
         # ISO 32000-2 Algorithm 2.B mandates this revision-6 iterative transform.
-        initial_hash = sha256(password)  # codeql[py/weak-sensitive-data-hashing]
+        # codeql[py/weak-sensitive-data-hashing]
+        initial_hash = sha256(password)
         initial_hash.update(salt)
         if vector is not None:
             initial_hash.update(vector)
@@ -649,7 +652,8 @@ class PDFStandardSecurityHandlerV5(PDFStandardSecurityHandlerV4):
             # compute the first 16 bytes of e,
             # interpreted as an unsigned integer mod 3
             next_hash = hashes[self._bytes_mod_3(e[:16])]
-            k = next_hash(e).digest()  # codeql[py/weak-sensitive-data-hashing]
+            # codeql[py/weak-sensitive-data-hashing]
+            k = next_hash(e).digest()
             last_byte_val = e[len(e) - 1]
             round_no += 1
         return k[:32]
