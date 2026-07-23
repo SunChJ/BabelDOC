@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import tarfile
 from pathlib import Path
 
@@ -121,6 +122,90 @@ def test_runtime_archive_rejects_symlinks_outside_bundle(tmp_path: Path) -> None
         create_archive(
             bundle,
             tmp_path / "runtime.tar.gz",
+            epoch=SOURCE_DATE_EPOCH,
+        )
+
+
+def test_runtime_archive_materializes_directory_symlinks_inside_bundle(
+    tmp_path: Path,
+) -> None:
+    bundle = tmp_path / "gloss-babeldoc-runtime"
+    resources = bundle / "_internal" / "Python.framework" / "Versions" / "3.12"
+    resources.mkdir(parents=True)
+    (resources / "Info.plist").write_text("framework metadata\n", encoding="utf-8")
+    framework = bundle / "_internal" / "Python.framework"
+    (framework / "Resources").symlink_to(
+        "Versions/3.12",
+        target_is_directory=True,
+    )
+
+    output = tmp_path / "runtime.tar.gz"
+    create_archive(bundle, output, epoch=SOURCE_DATE_EPOCH)
+
+    with tarfile.open(output, "r:gz") as archive:
+        alias = archive.getmember(
+            "gloss-babeldoc-runtime/_internal/Python.framework/Resources"
+        )
+        alias_file = archive.getmember(
+            "gloss-babeldoc-runtime/_internal/Python.framework/Resources/Info.plist"
+        )
+        assert alias.isdir()
+        assert alias_file.isfile()
+        assert archive.extractfile(alias_file).read() == b"framework metadata\n"
+        assert not any(
+            member.issym() or member.islnk() for member in archive.getmembers()
+        )
+
+
+def test_runtime_archive_rejects_directory_symlink_cycles(tmp_path: Path) -> None:
+    bundle = tmp_path / "gloss-babeldoc-runtime"
+    nested = bundle / "nested"
+    nested.mkdir(parents=True)
+    (nested / "back").symlink_to(bundle, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="directory cycle"):
+        create_archive(
+            bundle,
+            tmp_path / "runtime.tar.gz",
+            epoch=SOURCE_DATE_EPOCH,
+        )
+
+
+def test_runtime_archive_rejects_unresolvable_symlinks(tmp_path: Path) -> None:
+    bundle = tmp_path / "gloss-babeldoc-runtime"
+    bundle.mkdir()
+    (bundle / "missing").symlink_to("not-present")
+
+    with pytest.raises(ValueError, match="cannot be resolved"):
+        create_archive(
+            bundle,
+            tmp_path / "runtime.tar.gz",
+            epoch=SOURCE_DATE_EPOCH,
+        )
+
+
+def test_runtime_archive_rejects_special_entries(tmp_path: Path) -> None:
+    bundle = tmp_path / "gloss-babeldoc-runtime"
+    bundle.mkdir()
+    fifo = bundle / "runtime.fifo"
+    os.mkfifo(fifo)
+
+    with pytest.raises(ValueError, match="regular file or directory"):
+        create_archive(
+            bundle,
+            tmp_path / "runtime.tar.gz",
+            epoch=SOURCE_DATE_EPOCH,
+        )
+
+
+def test_runtime_archive_rejects_output_inside_source(tmp_path: Path) -> None:
+    bundle = tmp_path / "gloss-babeldoc-runtime"
+    bundle.mkdir()
+
+    with pytest.raises(ValueError, match="outside the source bundle"):
+        create_archive(
+            bundle,
+            bundle / "runtime.tar.gz",
             epoch=SOURCE_DATE_EPOCH,
         )
 
