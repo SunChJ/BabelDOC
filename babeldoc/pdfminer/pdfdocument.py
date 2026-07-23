@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import KeysView
 from collections.abc import Sequence
+from functools import partial
 from hashlib import md5
 from hashlib import sha256
 from hashlib import sha384
@@ -50,6 +51,11 @@ from babeldoc.pdfminer.utils import nunpack
 from babeldoc.pdfminer import settings
 
 log = logging.getLogger(__name__)
+
+# ISO 32000 requires MD5 for legacy PDF encryption revisions. The
+# usedforsecurity flag makes this file-format compatibility use explicit and
+# keeps it available on Python builds that restrict security-sensitive MD5.
+_pdf_spec_md5 = partial(md5, usedforsecurity=False)
 
 
 class PDFNoValidXRef(PDFSyntaxError):
@@ -386,9 +392,7 @@ class PDFStandardSecurityHandler:
             # Algorithm 3.5
             # ISO 32000-1 Algorithm 3.5 mandates MD5 for this legacy PDF format;
             # this is file-format compatibility, not application password storage.
-            hash = md5(
-                self.PASSWORD_PADDING  # noqa -- mandated PDF MD5 transform
-            )
+            hash = _pdf_spec_md5(self.PASSWORD_PADDING)
             hash.update(self.docid[0])  # 3
             result = Arcfour(key).encrypt(hash.digest())  # 4
             for i in range(1, 20):  # 5
@@ -401,7 +405,7 @@ class PDFStandardSecurityHandler:
         # Algorithm 3.2
         password = (password + self.PASSWORD_PADDING)[:32]  # 1
         # ISO 32000-1 Algorithm 3.2 mandates MD5 for legacy PDF key derivation.
-        hash = md5(password)  # noqa -- mandated PDF MD5 transform
+        hash = _pdf_spec_md5(password)
         hash.update(self.o)  # 3
         # See https://github.com/pdfminer/pdfminer.six/issues/186
         hash.update(struct.pack("<L", self.p))  # 4
@@ -414,8 +418,7 @@ class PDFStandardSecurityHandler:
         if self.r >= 3:
             n = self.length // 8
             for _ in range(50):
-                # codeql[py/weak-sensitive-data-hashing]
-                result = md5(result[:n]).digest()
+                result = _pdf_spec_md5(result[:n]).digest()
         return result[:n]
 
     def authenticate(self, password: str) -> bytes | None:
@@ -443,12 +446,10 @@ class PDFStandardSecurityHandler:
         # Algorithm 3.7
         password = (password + self.PASSWORD_PADDING)[:32]
         # ISO 32000-1 Algorithm 3.7 mandates MD5 for owner-password recovery.
-        # codeql[py/weak-sensitive-data-hashing]
-        hash = md5(password)
+        hash = _pdf_spec_md5(password)
         if self.r >= 3:
             for _ in range(50):
-                # codeql[py/weak-sensitive-data-hashing]
-                hash = md5(hash.digest())
+                hash = _pdf_spec_md5(hash.digest())
         n = 5
         if self.r >= 3:
             n = self.length // 8
@@ -474,7 +475,7 @@ class PDFStandardSecurityHandler:
     def decrypt_rc4(self, objid: int, genno: int, data: bytes) -> bytes:
         assert self.key is not None
         key = self.key + struct.pack("<L", objid)[:3] + struct.pack("<L", genno)[:2]
-        hash = md5(key)
+        hash = _pdf_spec_md5(key)
         key = hash.digest()[: min(len(key), 16)]
         return Arcfour(key).decrypt(data)
 
@@ -539,7 +540,7 @@ class PDFStandardSecurityHandlerV4(PDFStandardSecurityHandler):
             + struct.pack("<L", genno)[:2]
             + b"sAlT"
         )
-        hash = md5(key)
+        hash = _pdf_spec_md5(key)
         key = hash.digest()[: min(len(key), 16)]
         initialization_vector = data[:16]
         ciphertext = data[16:]
