@@ -130,7 +130,7 @@ def test_worker_start_failure_returns_replayable_failed_execution(
 
 def test_terminal_event_does_not_release_single_active_worker_early() -> None:
     runner = BlockingRunner()
-    store = ExecutionStore(runner)
+    store = ExecutionStore(runner, terminal_handoff_wait_seconds=0)
     first = store.create({"task_id": "first", "mode": "result_then_block"})
     assert runner.started.wait(timeout=1)
     wait_until(lambda: store.snapshot(first["execution_id"])["status"] == "succeeded")
@@ -144,6 +144,25 @@ def test_terminal_event_does_not_release_single_active_worker_early() -> None:
     runner.release.set()
     wait_until(lambda: snapshot_is_finished(store, first["execution_id"]))
     second = store.create({"task_id": "second", "mode": "finish"})
+    wait_until(lambda: snapshot_is_finished(store, second["execution_id"]))
+    assert store.snapshot(second["execution_id"])["status"] == "succeeded"
+
+
+def test_create_waits_for_terminal_worker_handoff() -> None:
+    runner = BlockingRunner()
+    store = ExecutionStore(runner, terminal_handoff_wait_seconds=1)
+    first = store.create({"task_id": "first", "mode": "result_then_block"})
+    assert runner.started.wait(timeout=1)
+    wait_until(lambda: store.snapshot(first["execution_id"])["status"] == "succeeded")
+
+    release = threading.Timer(0.05, runner.release.set)
+    release.start()
+    try:
+        second = store.create({"task_id": "second", "mode": "finish"})
+    finally:
+        release.join(timeout=1)
+
+    wait_until(lambda: snapshot_is_finished(store, first["execution_id"]))
     wait_until(lambda: snapshot_is_finished(store, second["execution_id"]))
     assert store.snapshot(second["execution_id"])["status"] == "succeeded"
 
