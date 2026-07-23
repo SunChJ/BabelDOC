@@ -47,6 +47,7 @@ uv run --no-sync pyinstaller \
   --collect-all babeldoc \
   --collect-all bitstring \
   --collect-all pymupdf \
+  --collect-submodules tiktoken_ext \
   --hidden-import babeldoc.tools.executor.babeldoc_adapter \
   --hidden-import babeldoc.tools.executor.layout_server \
   babeldoc/gloss_cli.py

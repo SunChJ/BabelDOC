@@ -9,8 +9,10 @@ import subprocess
 import sys
 from importlib import metadata
 from pathlib import Path
+from types import ModuleType
 
 import pytest
+from babeldoc.gloss_cli import _verify_packaged_dependencies
 from babeldoc.gloss_cli import build_runtime_info
 from babeldoc.gloss_cli import cli
 
@@ -127,6 +129,21 @@ def test_package_smoke_runs_dependency_check(
         "ok": True,
         "schema_version": 1,
     }
+
+
+def test_packaged_dependency_check_loads_o200k_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ("bitstring", "onnx", "onnxruntime", "pymupdf"):
+        monkeypatch.setitem(sys.modules, name, ModuleType(name))
+    tiktoken = ModuleType("tiktoken")
+    requested_encodings: list[str] = []
+    tiktoken.get_encoding = requested_encodings.append  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "tiktoken", tiktoken)
+
+    _verify_packaged_dependencies()
+
+    assert requested_encodings == ["o200k_base"]
 
 
 def test_serve_forwards_service_options(
