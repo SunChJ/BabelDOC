@@ -1,7 +1,7 @@
 # Gloss downstream provenance. Update downstream.version for every downstream
 # release; update the upstream block only in a reviewed upstream sync PR.
 [downstream]
-version = "0.6.4+gloss.4"
+version = "0.6.4+gloss.5"
 runtime_api_version = 1
 
 [upstream]
