@@ -50,6 +50,7 @@ REQUEST_TIMEOUT_SECONDS = 10.0
 SHUTDOWN_CANCEL_TIMEOUT_SECONDS = 5.0
 SHUTDOWN_DRAIN_POLL_SECONDS = 0.25
 PARENT_WATCHDOG_INTERVAL_SECONDS = 1.0
+EVENT_HEARTBEAT_INTERVAL_SECONDS = 5.0
 _TOKEN_CHARACTERS = frozenset(string.ascii_letters + string.digits + "-_")
 ALLOW_FAKE_RUNNER_ENV = "BABELDOC_EXECUTOR_ALLOW_FAKE"
 
@@ -221,7 +222,15 @@ class ExecutorServer(ThreadingHTTPServer):
         parent_start_time: float | None = None,
         runner_name: str = "injected",
         workroot: Path | None = None,
+        event_heartbeat_interval_seconds: float = (EVENT_HEARTBEAT_INTERVAL_SECONDS),
     ):
+        if not (
+            0 < event_heartbeat_interval_seconds <= EVENT_HEARTBEAT_INTERVAL_SECONDS
+        ):
+            raise ValueError(
+                "event_heartbeat_interval_seconds must be greater than zero "
+                "and no more than five seconds"
+            )
         super().__init__(server_address, ExecutorHandler)
         self.store = store
         self.token = token
@@ -230,6 +239,7 @@ class ExecutorServer(ThreadingHTTPServer):
         self.parent_start_time = parent_start_time
         self.runner_name = runner_name
         self.workroot = workroot
+        self.event_heartbeat_interval_seconds = event_heartbeat_interval_seconds
         self.started_at = time.time()
         self._stopping = threading.Event()
         self._lifecycle_lock = threading.RLock()
@@ -895,7 +905,22 @@ class ExecutorHandler(BaseHTTPRequestHandler):
         )
         cursor = after_seq
         try:
-            for event in self.server.store.stream(execution_id, after_seq):
+            for event in self.server.store.stream(
+                execution_id,
+                after_seq,
+                heartbeat_interval_seconds=(
+                    self.server.event_heartbeat_interval_seconds
+                ),
+            ):
+                if event is None:
+                    self.wfile.write(
+                        _heartbeat_json_line(
+                            execution_id=execution_id,
+                            instance_id=self.server.instance_id,
+                        )
+                    )
+                    self.wfile.flush()
+                    continue
                 cursor = event.sequence
                 self.wfile.write(
                     _event_json_line(event, instance_id=self.server.instance_id)
@@ -1027,6 +1052,22 @@ def _event_json_line(event, *, instance_id: str) -> bytes:
         "sequence": event.sequence,
         "emitted_at": event.emitted_at,
         "payload": event.payload,
+    }
+    return (
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _heartbeat_json_line(*, execution_id: str, instance_id: str) -> bytes:
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "service_id": SERVICE_ID,
+        "instance_id": instance_id,
+        "type": "heartbeat",
+        "execution_id": execution_id,
+        "sequence": None,
+        "emitted_at": time.time(),
+        "payload": {},
     }
     return (
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"

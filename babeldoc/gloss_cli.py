@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
 from collections.abc import Sequence
 from importlib import metadata
 from typing import Any
@@ -22,6 +23,10 @@ UPSTREAM_COMMIT = "17480db9df92ddcb37349ce34b312335226e8ec9"
 CAPABILITIES = (
     "executor.events.ndjson.v1",
     "executor.http.v1",
+    "font-assets.memory-cache.v1",
+    "layout-ir-cache.v1",
+    "layout.rpc-doclayout8.v1",
+    "performance.telemetry.v1",
     "runtime-info.v1",
 )
 
@@ -68,6 +73,10 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Emit one machine-readable JSON object.",
     )
+    commands.add_parser(
+        "package-smoke",
+        help=argparse.SUPPRESS,
+    )
     serve = commands.add_parser(
         "serve",
         help="Run the authenticated loopback PDF executor service.",
@@ -84,12 +93,35 @@ def create_parser() -> argparse.ArgumentParser:
     serve.add_argument("--instance-id")
     serve.add_argument("--parent-pid", type=int)
     serve.add_argument("--parent-start-time", type=float)
+    layout_serve = commands.add_parser(
+        "layout-serve",
+        help="Run the loopback DocLayout inference service.",
+    )
+    layout_serve.add_argument("--host", default="127.0.0.1")
+    layout_serve.add_argument("--port", type=int, default=0)
+    layout_serve.add_argument("--parent-pid", type=int, required=True)
+    layout_serve.add_argument(
+        "--model",
+        choices=("onnx", "fake"),
+        default="onnx",
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
 def cli(argv: Sequence[str] | None = None) -> int:
     """Run the lightweight Gloss integration CLI."""
     args = create_parser().parse_args(argv)
+    if args.command == "layout-serve":
+        from babeldoc.tools.executor.layout_server import serve as serve_layout
+
+        serve_layout(
+            args.host,
+            args.port,
+            parent_pid=args.parent_pid,
+            model_name=args.model,
+        )
+        return 0
     if args.command == "serve":
         from babeldoc.tools.executor.server import serve
 
@@ -103,6 +135,10 @@ def cli(argv: Sequence[str] | None = None) -> int:
             parent_pid=args.parent_pid,
             parent_start_time=args.parent_start_time,
         )
+        return 0
+    if args.command == "package-smoke":
+        _verify_packaged_dependencies()
+        print('{"ok":true,"schema_version":1}')
         return 0
     if args.command != "runtime-info":  # pragma: no cover - argparse owns routing
         raise AssertionError(f"Unexpected command: {args.command}")
@@ -125,5 +161,16 @@ def cli(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def _verify_packaged_dependencies() -> None:
+    """Import the native modules required by real PDF and layout execution."""
+    import bitstring
+    import onnx
+    import onnxruntime
+    import pymupdf
+
+    del bitstring, onnx, onnxruntime, pymupdf
+
+
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     raise SystemExit(cli())

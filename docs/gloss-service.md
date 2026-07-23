@@ -137,7 +137,10 @@ shape is:
     }
   },
   "assets": {
-    "glossaries": []
+    "glossaries": [],
+    "layout_ir_cache": {
+      "enabled": true
+    }
   },
   "metadata": {
     "metadata_extra_data": null
@@ -151,6 +154,12 @@ in snapshots or events. `qps`, `max_pages_per_part`, `pool_max_workers`, and
 `term_pool_max_workers` must be positive integers (JSON booleans are not
 integers). `report_interval_seconds` must be a positive number. `no_dual` and
 `no_mono` cannot both be true.
+
+`assets.layout_ir_cache.enabled` is optional and defaults to `false` for
+protocol compatibility. When enabled, the runtime chooses a private cache
+directory and derives the cache key itself. It is eligible only for
+non-debug, unsplit, full-document executions that skip scanned-document
+detection. No client-controlled cache path or key is accepted.
 
 ## State, events, and output validation
 
@@ -186,7 +195,21 @@ Normal event lines have this envelope:
     "stage_total": 20,
     "overall_progress": 42,
     "part_index": 1,
-    "total_parts": 1
+    "total_parts": 1,
+    "performance": {
+      "schema_version": 1,
+      "phase": "translating",
+      "elapsed_milliseconds": 12401,
+      "phase_timings_milliseconds": {
+        "launching": 320,
+        "parsing": 3100,
+        "translating": 8981,
+        "typesetting": 0,
+        "saving": 0,
+        "finalizing": 0
+      },
+      "layout_ir_cache_status": "hit"
+    }
   }
 }
 ```
@@ -198,6 +221,12 @@ containment, regular-file type, extension, PDF header, at least one page, and
 successful first-page loading with MuPDF. The requested mono and/or dual
 outputs must be present. Auto-extracted glossary output is likewise confined
 to the execution output directory.
+
+The terminal result contains a final top-level `performance` object with
+`phase` set to `completed`. Phase durations use a monotonic clock and
+accumulate when split parts revisit a phase. Cache status is one of
+`disabled`, `ineligible`, `miss`, `hit`, `stored`, `invalidated`,
+`input_changed`, `unsafe_directory`, `read_error`, or `write_error`.
 
 A cancelled payload is stable across cooperative and forced cancellation:
 
@@ -218,6 +247,12 @@ A cancelled payload is stable across cooperative and forced cancellation:
 Gloss stores `instance_id`, `execution_id`, and the last consumed sequence.
 Disconnecting an event stream does not cancel its execution. For the same
 instance, reconnect with `after_sequence=<last-consumed-sequence>`.
+
+While an execution is active and no normal events arrive, the stream emits a
+`heartbeat` control record at least once every five seconds. It carries the
+schema, service, instance, and execution identity, with `sequence: null` and an
+empty payload. Heartbeats are not retained or replayed and do not advance the
+client's sequence cursor.
 
 The service retains the 16 most recent executions and up to 1,000 events per
 execution. An already-trimmed cursor returns `410 replay_gap` with a snapshot;
@@ -250,7 +285,23 @@ SIGINT, SIGTERM, and parent disappearance use the same controlled path.
 ## Compatibility boundary
 
 The protocol is advertised by `gloss-babeldoc runtime-info` as
-`executor.http.v1` and `executor.events.ndjson.v1`. The ordinary `babeldoc` CLI
-remains available while Gloss migrates to the service. Font caching, layout-IR
-caching, and PDF-generation performance changes remain separate downstream
-patches.
+`executor.http.v1` and `executor.events.ndjson.v1`. Performance support is
+advertised independently as `font-assets.memory-cache.v1`,
+`layout-ir-cache.v1`, and `performance.telemetry.v1`.
+
+The same executable provides the persistent layout gateway used by
+`rpc_doclayout8`:
+
+```text
+gloss-babeldoc layout-serve \
+  --host 127.0.0.1 \
+  --port 0 \
+  --parent-pid 1234
+```
+
+It reports `__GLOSS_BABELDOC_LAYOUT_READY__<port>` only after the ONNX model is
+ready, exposes `GET /healthz` and `POST /inference`, and exits when its owning
+Gloss process disappears. This is advertised as
+`layout.rpc-doclayout8.v1`, allowing the self-contained runtime to operate
+without a system Python installation. The ordinary `babeldoc` CLI remains
+available for debugging and upstream compatibility.

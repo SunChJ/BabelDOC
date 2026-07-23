@@ -271,9 +271,14 @@ class ExecutionStore:
         execution_id: str,
         after_seq: int,
         wait_seconds: float = 0.25,
-    ) -> Iterable[EventEnvelope]:
+        heartbeat_interval_seconds: float = 5.0,
+    ) -> Iterable[EventEnvelope | None]:
+        if heartbeat_interval_seconds <= 0:
+            raise ValueError("heartbeat_interval_seconds must be positive")
         cursor = after_seq
+        next_heartbeat_at = time.monotonic() + heartbeat_interval_seconds
         while True:
+            heartbeat_due = False
             with self._condition:
                 record = self._require_record_locked(execution_id)
                 self._raise_if_gap_locked(record, cursor)
@@ -285,13 +290,29 @@ class ExecutionStore:
                     and status in ACTIVE_EXECUTION_STATUSES
                     and not worker_finished
                 ):
-                    self._condition.wait(timeout=wait_seconds)
-                    continue
+                    now = time.monotonic()
+                    if now >= next_heartbeat_at:
+                        heartbeat_due = True
+                    else:
+                        self._condition.wait(
+                            timeout=min(
+                                wait_seconds,
+                                next_heartbeat_at - now,
+                            )
+                        )
+                        continue
+
+            if heartbeat_due:
+                yield None
+                next_heartbeat_at = time.monotonic() + heartbeat_interval_seconds
+                continue
 
             for event in pending:
                 cursor = event.sequence
                 yield event
 
+            if pending:
+                next_heartbeat_at = time.monotonic() + heartbeat_interval_seconds
             if pending and pending[-1].type in TERMINAL_EVENT_TYPES:
                 return
             if not pending and (

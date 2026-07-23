@@ -40,6 +40,10 @@ def test_build_runtime_info_contract() -> None:
     assert payload["capabilities"] == [
         "executor.events.ndjson.v1",
         "executor.http.v1",
+        "font-assets.memory-cache.v1",
+        "layout-ir-cache.v1",
+        "layout.rpc-doclayout8.v1",
+        "performance.telemetry.v1",
         "runtime-info.v1",
     ]
 
@@ -107,6 +111,24 @@ def test_unknown_command_exits_with_argparse_error() -> None:
     assert error.value.code == 2
 
 
+def test_package_smoke_runs_dependency_check(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls = []
+    monkeypatch.setattr(
+        "babeldoc.gloss_cli._verify_packaged_dependencies",
+        lambda: calls.append("checked"),
+    )
+
+    assert cli(["package-smoke"]) == 0
+    assert calls == ["checked"]
+    assert json.loads(capsys.readouterr().out) == {
+        "ok": True,
+        "schema_version": 1,
+    }
+
+
 def test_serve_forwards_service_options(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -168,3 +190,35 @@ def test_serve_defaults_to_ephemeral_loopback(
     assert cli(["serve", "--runner", "fake"]) == 0
     assert received["host"] == "127.0.0.1"
     assert received["port"] == 0
+
+
+def test_layout_serve_forwards_service_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received: dict[str, object] = {}
+
+    def fake_serve(host: str, port: int, **kwargs: object) -> None:
+        received.update({"host": host, "port": port, **kwargs})
+
+    monkeypatch.setattr("babeldoc.tools.executor.layout_server.serve", fake_serve)
+
+    assert (
+        cli(
+            [
+                "layout-serve",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "49153",
+                "--parent-pid",
+                "42",
+            ]
+        )
+        == 0
+    )
+    assert received == {
+        "host": "127.0.0.1",
+        "port": 49153,
+        "parent_pid": 42,
+        "model_name": "onnx",
+    }
