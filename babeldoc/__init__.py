@@ -1,2 +1,2 @@
 # Gloss downstream release identity; see DOWNSTREAM.md.
-__version__ = "0.6.4+gloss.2"
+__version__ = "0.6.4+gloss.3"

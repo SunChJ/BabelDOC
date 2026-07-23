@@ -27,7 +27,7 @@ from babeldoc.translator.translator import set_translate_rate_limiter
 
 logger = logging.getLogger(__name__)
 # Gloss downstream release identity; see DOWNSTREAM.md.
-__version__ = "0.6.4+gloss.2"
+__version__ = "0.6.4+gloss.3"
 
 
 def create_parser():

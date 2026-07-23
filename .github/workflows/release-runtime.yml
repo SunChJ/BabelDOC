@@ -1,0 +1,221 @@
+name: Release self-contained Gloss runtime
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-runtime:
+    name: macOS runtime (${{ matrix.architecture }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            architecture: arm64
+          - runner: macos-15-intel
+            architecture: x86_64
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Setup uv with Python 3.12
+        uses: astral-sh/setup-uv@85856786d1ce8acfbcc2f13a5f3fbd6b938f9f41 # v7.1.2
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install locked build dependencies
+        run: uv sync --frozen --no-default-groups --group release
+
+      - name: Validate release tag
+        id: release
+        shell: bash
+        run: |
+          version=$(uv run --frozen --no-default-groups --group release python -c \
+            'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          expected_tag="v${version/+/-}"
+          if [[ "$GITHUB_EVENT_NAME" = "push" ]]; then
+            actual_tag=$(git describe --tags --exact-match)
+            test "$actual_tag" = "$expected_tag"
+            test "$GITHUB_REF_TYPE" = "tag"
+            test "$GITHUB_REF_NAME" = "$expected_tag"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "source_date_epoch=$(git show -s --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build self-contained runtime
+        shell: bash
+        run: |
+          mkdir -p release
+          test "$(uname -m)" = "${{ matrix.architecture }}"
+          bash scripts/release/build_macos_runtime.sh \
+            "${{ steps.release.outputs.version }}" \
+            "${{ steps.release.outputs.source_date_epoch }}" \
+            "$PWD/release"
+
+      - name: Smoke packaged services without system Python
+        shell: bash
+        run: |
+          tag_version=${{ steps.release.outputs.version }}
+          tag_version=${tag_version/+/-}
+          archive="release/gloss-babeldoc-${tag_version}-macos-${{ matrix.architecture }}.tar.gz"
+          test -s "$archive"
+          mkdir -p "$RUNNER_TEMP/runtime-smoke"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/runtime-smoke"
+          uv run --frozen --no-default-groups --group release python \
+            scripts/release/smoke_runtime.py \
+            "$RUNNER_TEMP/runtime-smoke/gloss-babeldoc-runtime/gloss-babeldoc"
+
+      - name: Upload native runtime
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gloss-babeldoc-macos-${{ matrix.architecture }}
+          path: release/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Sign, attest, and publish
+    needs: macos-runtime
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Setup uv with Python 3.12
+        uses: astral-sh/setup-uv@85856786d1ce8acfbcc2f13a5f3fbd6b938f9f41 # v7.1.2
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Validate release tag
+        id: release
+        shell: bash
+        run: |
+          version=$(uv run --frozen --no-default-groups python -c \
+            'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          expected_tag="v${version/+/-}"
+          actual_tag=$(git describe --tags --exact-match)
+          test "$actual_tag" = "$expected_tag"
+          test "$GITHUB_REF_TYPE" = "tag"
+          test "$GITHUB_REF_NAME" = "$expected_tag"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$expected_tag" >> "$GITHUB_OUTPUT"
+          echo "tag_version=${version/+/-}" >> "$GITHUB_OUTPUT"
+          echo "source_date_epoch=$(git show -s --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Install locked release dependencies
+        run: uv sync --frozen --no-default-groups
+
+      - name: Download native runtimes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: gloss-babeldoc-macos-*
+          path: release
+          merge-multiple: true
+
+      - name: Verify native runtime set
+        shell: bash
+        run: |
+          test -s "release/gloss-babeldoc-${{ steps.release.outputs.tag_version }}-macos-arm64.tar.gz"
+          test -s "release/gloss-babeldoc-${{ steps.release.outputs.tag_version }}-macos-x86_64.tar.gz"
+
+      - name: Build reproducible wheel and source distribution
+        shell: bash
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.release.outputs.source_date_epoch }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/dist-first" "$RUNNER_TEMP/dist-second"
+          uv build --wheel --sdist --out-dir "$RUNNER_TEMP/dist-first"
+          uv build --wheel --sdist --out-dir "$RUNNER_TEMP/dist-second"
+          for first in "$RUNNER_TEMP/dist-first"/*; do
+            name=$(basename "$first")
+            cmp "$first" "$RUNNER_TEMP/dist-second/$name"
+          done
+          cp "$RUNNER_TEMP/dist-first"/* release/
+
+      - name: Build deterministic source archive
+        shell: bash
+        run: |
+          prefix="BabelDOC-${{ steps.release.outputs.tag_version }}/"
+          git archive --format=tar --prefix="$prefix" HEAD > "$RUNNER_TEMP/source.tar"
+          gzip -n -9 "$RUNNER_TEMP/source.tar"
+          mv "$RUNNER_TEMP/source.tar.gz" \
+            "release/BabelDOC-${{ steps.release.outputs.tag_version }}-source.tar.gz"
+          cp LICENSE NOTICE release/
+
+      - name: Generate runtime manifest and provenance
+        shell: bash
+        run: |
+          uv run --frozen --no-default-groups python \
+            -m scripts.release.runtime_manifest \
+            --release-dir release \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$GITHUB_SHA" \
+            --source-date-epoch "${{ steps.release.outputs.source_date_epoch }}"
+
+      - name: Sign and verify runtime manifest
+        shell: bash
+        env:
+          BABELDOC_RUNTIME_SIGNING_KEY_BASE64: ${{ secrets.BABELDOC_RUNTIME_SIGNING_KEY_BASE64 }}
+        run: |
+          test -n "$BABELDOC_RUNTIME_SIGNING_KEY_BASE64"
+          uv run --frozen --no-default-groups python \
+            -m scripts.release.sign_manifest \
+            --manifest release/gloss-runtime-manifest.json \
+            --signature release/gloss-runtime-manifest.json.sig
+          uv run --frozen --no-default-groups python \
+            -m scripts.release.sign_manifest \
+            --manifest release/gloss-runtime-manifest.json \
+            --signature release/gloss-runtime-manifest.json.sig \
+            --verify
+          cp release/gloss-runtime-manifest.json.sig \
+            release/gloss-runtime-manifest.sig
+
+      - name: Generate and verify release checksums
+        shell: bash
+        run: |
+          (
+            cd release
+            while IFS= read -r file; do
+              sha256sum "$file"
+            done < <(find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | LC_ALL=C sort) \
+              > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: release/*
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: BabelDOC ${{ steps.release.outputs.version }}
+          body_path: docs/release-notes/v${{ steps.release.outputs.tag_version }}.md
+          files: release/*
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          draft: false
+          prerelease: false
+          make_latest: true
