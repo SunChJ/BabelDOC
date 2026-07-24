@@ -167,8 +167,10 @@ def _verify_packaged_dependencies() -> None:
     import onnx
     import onnxruntime
     import pymupdf
+    import tiktoken
 
-    del bitstring, onnx, onnxruntime, pymupdf
+    tiktoken.get_encoding("o200k_base")
+    del bitstring, onnx, onnxruntime, pymupdf, tiktoken
 
 
 if __name__ == "__main__":

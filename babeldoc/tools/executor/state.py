@@ -79,14 +79,18 @@ class ExecutionStore:
         runner: ExecutionRunner | None = None,
         max_event_log_size: int = MAX_EVENT_LOG_SIZE,
         max_execution_history_size: int = MAX_EXECUTION_HISTORY_SIZE,
+        terminal_handoff_wait_seconds: float = 2.0,
     ):
         if max_event_log_size <= 0:
             raise ValueError("max_event_log_size must be positive")
         if max_execution_history_size <= 0:
             raise ValueError("max_execution_history_size must be positive")
+        if terminal_handoff_wait_seconds < 0:
+            raise ValueError("terminal_handoff_wait_seconds must not be negative")
         self._runner = runner or UnavailableRunner()
         self._max_event_log_size = max_event_log_size
         self._max_execution_history_size = max_execution_history_size
+        self._terminal_handoff_wait_seconds = terminal_handoff_wait_seconds
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
         self._records: OrderedDict[str, ExecutionRecord] = OrderedDict()
@@ -107,6 +111,29 @@ class ExecutionStore:
                 return self._create_response_locked(existing, replayed=True)
 
             active = self._active_record_locked()
+            if (
+                active is not None
+                and active.status in TERMINAL_EXECUTION_STATUSES
+                and self._terminal_handoff_wait_seconds > 0
+            ):
+                previous_execution_id = active.execution_id
+                logger.info(
+                    "executor waiting for terminal worker handoff: requested_task_id=%s active_task_id=%s active_execution_id=%s timeout_seconds=%s",
+                    task_id,
+                    active.task_id,
+                    active.execution_id,
+                    self._terminal_handoff_wait_seconds,
+                )
+                self._condition.wait_for(
+                    lambda: self._active_execution_id != previous_execution_id,
+                    timeout=self._terminal_handoff_wait_seconds,
+                )
+                existing = self._record_for_task_locked(task_id)
+                if existing is not None:
+                    if existing.request_fingerprint != request_fingerprint:
+                        raise ExecutionConflictError(self._snapshot_locked(existing))
+                    return self._create_response_locked(existing, replayed=True)
+                active = self._active_record_locked()
             if active is not None:
                 logger.warning(
                     "executor create rejected because active execution exists: requested_task_id=%s active_task_id=%s active_execution_id=%s",
